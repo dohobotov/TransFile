@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Production build outputs
+dist/
+dist-ssr/
+
+# Tauri & Rust build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Release archives and installers (distribute via GitHub Releases)
+TransFile.exe
+TransFile-Setup.exe
+TransFile-Portable.zip
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Test and scratch files
+out.txt
+test_*.txt
+
+# IDE & Editor files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db

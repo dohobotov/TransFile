@@ -1,0 +1,32 @@
+mod adb;
+mod dialog;
+mod scanner;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            adb::check_adb_status,
+            adb::set_custom_adb_path,
+            adb::get_connected_devices,
+            adb::connect_device,
+            adb::auto_connect_lan_devices,
+            adb::disconnect_device,
+            adb::pair_device,
+            adb::switch_to_tcpip,
+            adb::list_device_files,
+            adb::create_device_folder,
+            adb::delete_device_item,
+            adb::push_files_to_device,
+            adb::push_files_to_multiple_devices,
+            adb::pull_file_from_device,
+            scanner::discover_network_devices,
+            dialog::pick_local_files,
+            dialog::pick_local_folder,
+            dialog::pick_save_folder,
+            dialog::pick_adb_executable
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
