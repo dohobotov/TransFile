@@ -58,19 +58,22 @@
 
 ## 🚀 Быстрый старт (Запуск без сборки)
 
+> [!TIP]
+> Все готовые сборки и установщики доступны на странице **[GitHub Releases](https://github.com/dohobotov/TransFile/releases/latest)**.
+
 Приложение поставляется со встроенными утилитами ADB (`bin/adb.exe`, `bin/AdbWinApi.dll`, `bin/AdbWinUsbApi.dll`). Устанавливать Android SDK отдельно **не требуется**.
 
-Выберите удобный для вас вариант запуска:
+Выберите удобный для вас вариант:
 
 ### Вариант 1: Портативная версия (Portable) — Рекомендуется
-1. Скачайте архив **`TransFile-Portable.zip`** или файл **`TransFile.exe`**.
-2. Распакуйте архив в любую удобную папку (убедитесь, что папка `bin` находится рядом с файлом `TransFile.exe`).
+1. Скачайте **[TransFile-Portable.zip](https://github.com/dohobotov/TransFile/releases/latest)** или исполняемый файл **`TransFile.exe`**.
+2. Распакуйте архив в любую удобную папку (папка `bin` должна находиться рядом с файлом `TransFile.exe`).
 3. Запустите **`TransFile.exe`**.
 
 ### Вариант 2: Установщик Windows (Setup)
-1. Скачайте **`TransFile-Setup.exe`**.
+1. Скачайте инсталлятор **[TransFile-Setup.exe](https://github.com/dohobotov/TransFile/releases/latest)**.
 2. Запустите установщик. Он установит программу в систему, добавит ярлык на рабочий стол и в меню «Пуск».
-3. Программа готова к запуску!
+3. Программа готова к работе!
 
 ---
 
