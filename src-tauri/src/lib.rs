@@ -1,6 +1,7 @@
 mod adb;
 mod connection;
 mod dialog;
+mod proc_guard;
 mod scanner;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

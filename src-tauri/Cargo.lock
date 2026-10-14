@@ -4137,7 +4137,7 @@ dependencies = [
 
 [[package]]
 name = "transfile"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "mdns-sd",
  "regex",
@@ -4148,6 +4148,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

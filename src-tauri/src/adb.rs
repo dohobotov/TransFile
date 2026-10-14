@@ -239,8 +239,14 @@ pub async fn execute_adb_command_async(args: &[&str], timeout_secs: u64) -> Resu
         cmd.creation_flags(0x08000000);
     }
     cmd.kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().map_err(|e| format!("Ошибка запуска ADB: {}", e))?;
+    // Long waits (e.g. a 5-minute readiness probe) must not outlive the app
+    crate::proc_guard::bind_to_app_lifetime(&child);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait_with_output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();

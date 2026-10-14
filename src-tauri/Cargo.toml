@@ -1,6 +1,6 @@
 [package]
 name = "transfile"
-version = "0.1.0"
+version = "1.1.0"
 description = "TransFile - Lightweight ADB File Transfer"
 authors = ["TransFile"]
 edition = "2024"
@@ -23,6 +23,9 @@ tokio = { version = "1", features = ["full"] }
 rfd = "0.15"
 regex = "1"
 mdns-sd = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

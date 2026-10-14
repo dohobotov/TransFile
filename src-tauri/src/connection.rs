@@ -278,6 +278,7 @@ async fn run_tracker(app: &AppHandle, known: &mut HashMap<String, AdbEntry>) -> 
     cmd.creation_flags(0x08000000);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    crate::proc_guard::bind_to_app_lifetime(&child);
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
     let mut buf = [0u8; 8192];
 
