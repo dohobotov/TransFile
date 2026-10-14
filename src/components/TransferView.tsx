@@ -26,17 +26,92 @@ import {
   Download,
   Music,
   Usb,
-  Radio,
   CheckSquare,
   Square,
-  Layers,
+  SquareMinus,
   Sparkles,
-  Smartphone,
   Monitor,
   KeyRound,
-  PlugZap,
+  Plug,
+  Unplug,
+  LoaderCircle,
+  TriangleAlert,
+  X,
 } from 'lucide-react';
 import { PairingModal } from './PairingModal';
+
+type GroupState = 'all' | 'some' | 'none';
+
+type LanRowStatus = 'connected' | 'unauthorized' | 'offline' | 'disconnected' | 'needsPairing';
+
+interface LanRow {
+  hostId: string;
+  host: DiscoveredHost;
+  conn?: DeviceInfo;
+  targetId: string | null;
+  status: LanRowStatus;
+}
+
+interface LanStatus {
+  kind: 'success' | 'warning' | 'error';
+  text: string;
+}
+
+const unique = <T,>(items: T[]): T[] => Array.from(new Set(items));
+
+const LAN_STATUS_STYLES = {
+  success: { tone: 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300', Icon: CheckCircle2 },
+  warning: { tone: 'bg-amber-500/10 border-amber-500/20 text-amber-300', Icon: TriangleAlert },
+  error: { tone: 'bg-rose-500/10 border-rose-500/20 text-rose-300', Icon: AlertCircle },
+} as const;
+
+const LAN_ROW_VIEW: Record<LanRowStatus, { dot: string; text: string; textClass: string; tooltip: string }> = {
+  connected: { dot: 'bg-emerald-400', text: 'Подключено', textClass: 'text-emerald-300', tooltip: 'Подключено по Wi-Fi' },
+  unauthorized: {
+    dot: 'bg-amber-400 animate-pulse',
+    text: 'Авторизация',
+    textClass: 'text-amber-300',
+    tooltip: 'Подтвердите отладку на экране устройства',
+  },
+  offline: { dot: 'bg-rose-500', text: 'Офлайн', textClass: 'text-rose-300', tooltip: 'Устройство не отвечает' },
+  disconnected: { dot: 'bg-[#475569]', text: 'Не подключено', textClass: 'text-[#7c879c]', tooltip: 'Не подключено' },
+  needsPairing: {
+    dot: 'bg-amber-400/60',
+    text: 'Нужен код',
+    textClass: 'text-amber-300/80',
+    tooltip: 'Android 11+: выполните сопряжение по коду',
+  },
+};
+
+const ROW_BASE = 'px-2.5 py-2 rounded-lg border transition flex items-center gap-2';
+const ROW_CHECKED = 'bg-sky-500/10 border-sky-500/35 cursor-pointer';
+const ROW_UNCHECKED = 'bg-[#151926] hover:bg-[#1a2030] border-[#222a3d] cursor-pointer';
+const ROW_DISABLED = 'bg-[#151926] border-[#222a3d] cursor-default';
+
+const LAN_BUTTON_BASE =
+  'h-7 px-2.5 rounded-lg border text-[11px] font-medium flex items-center gap-1.5 whitespace-nowrap transition disabled:opacity-40 disabled:cursor-not-allowed';
+
+// Tri-state checkbox for a group of recipients: all / some / none selected
+const GroupCheckbox: React.FC<{
+  state: GroupState;
+  disabled: boolean;
+  onToggle: () => void;
+  selectTitle: string;
+  clearTitle: string;
+}> = ({ state, disabled, onToggle, selectTitle, clearTitle }) => {
+  const Icon = state === 'all' ? CheckSquare : state === 'some' ? SquareMinus : Square;
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      disabled={disabled}
+      title={state === 'all' ? clearTitle : selectTitle}
+      className="p-0.5 -m-0.5 rounded hover:bg-white/5 transition disabled:opacity-40 shrink-0"
+    >
+      <Icon className={`w-4 h-4 ${state === 'none' ? 'text-[#475569]' : 'text-sky-400'}`} />
+    </button>
+  );
+};
 
 interface TransferViewProps {
   deviceSerial: string | null;
@@ -72,8 +147,6 @@ export const TransferView: React.FC<TransferViewProps> = ({
   const [isDragOver, setIsDragOver] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [infoMsg, setInfoMsg] = useState<string | null>(null);
-  const [isConnectingAll, setIsConnectingAll] = useState(false);
 
   // Set of selected target IDs (serial for connected, "ip:port" for unconnected network)
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(() => {
@@ -90,8 +163,17 @@ export const TransferView: React.FC<TransferViewProps> = ({
   const [multiProgress, setMultiProgress] = useState<Record<string, MultiTransferDeviceProgress>>({});
   // Track hosts currently connecting
   const [connectingHosts, setConnectingHosts] = useState<Set<string>>(new Set());
-  // Track Android 11+ pairing target
-  const [pairingTarget, setPairingTarget] = useState<{ host: string; connectHost: string } | null>(null);
+  // Track serials currently being disconnected by the toolbar «Отключить» action
+  const [disconnectingSerials, setDisconnectingSerials] = useState<Set<string>>(new Set());
+  // Bulk LAN action in progress (toolbar «Подключить» / «Отключить»)
+  const [lanAction, setLanAction] = useState<'connect' | 'disconnect' | null>(null);
+  // Read by startPushing after an awaited file dialog, when the render-time value may be outdated
+  const lanActionRef = useRef(lanAction);
+  lanActionRef.current = lanAction;
+  // Result of the last bulk LAN action, shown under the recipients toolbar
+  const [lanStatus, setLanStatus] = useState<LanStatus | null>(null);
+  // Track Android 11+ pairing target. connectHost = null: pairing-only endpoint, nothing to connect afterwards
+  const [pairingTarget, setPairingTarget] = useState<{ host: string; connectHost: string | null } | null>(null);
 
   // Deduplicate connected devices list to ensure exact emulator counts and prevent duplicate entries
   const uniqueConnectedDevices = useMemo(() => {
@@ -232,100 +314,138 @@ export const TransferView: React.FC<TransferViewProps> = ({
     return `${h.ip}:${h.port}`;
   };
 
-  // One click: mark every LAN device as a recipient and connect all not-yet-connected ones in parallel
-  const handleSelectAndConnectAllLan = async () => {
-    if (isConnectingAll) return;
-    setErrorMsg(null);
-    setInfoMsg(null);
+  // One row per LAN host: its active adb connection (if any), selection id and display status
+  const lanRows = useMemo<LanRow[]>(
+    () =>
+      lanHosts.map((h) => {
+        const hostId = `${h.ip}:${h.port}`;
+        const conn = findConnectedDeviceForHost(h);
+        let status: LanRowStatus;
+        if (conn) {
+          status =
+            conn.state === 'device' ? 'connected' : conn.state === 'unauthorized' ? 'unauthorized' : 'offline';
+        } else {
+          status = h.discovery_type === 'pairing' ? 'needsPairing' : 'disconnected';
+        }
+        return { hostId, host: h, conn, targetId: getLanTargetId(h), status };
+      }),
+    [lanHosts, uniqueConnectedDevices]
+  );
 
-    setSelectedTargetIds((prev) => {
-      const next = new Set(prev);
-      lanHosts.forEach((h) => {
-        const id = getLanTargetId(h);
-        if (id) next.add(id);
-      });
-      return next;
-    });
+  const isRowChecked = (r: LanRow) => !!r.targetId && selectedTargetIds.has(r.targetId);
 
-    const toConnect = lanHosts
-      .filter((h) => {
-        if (h.discovery_type === 'pairing') return false;
-        const c = findConnectedDeviceForHost(h);
-        return !c || c.state === 'offline';
-      })
-      .map((h) => `${h.ip}:${h.port}`);
+  // Toolbar «Подключить»: checked LAN hosts without a live connection. USB and emulators are never included.
+  const connectHosts = unique(
+    lanRows
+      .filter(
+        (r) =>
+          isRowChecked(r) &&
+          r.host.discovery_type !== 'pairing' &&
+          (r.status === 'disconnected' || r.status === 'offline') &&
+          !connectingHosts.has(r.hostId)
+      )
+      .map((r) => r.hostId)
+  );
 
-    if (toConnect.length === 0) {
-      setInfoMsg(
-        lanHosts.length === 0
-          ? 'В сети не найдено устройств. Нажмите «Сканировать».'
-          : 'Все устройства LAN уже подключены и выбраны.'
-      );
-      return;
-    }
+  // Toolbar «Отключить»: checked LAN rows with an adb connection. A pairing endpoint and a connect endpoint
+  // on the same IP can map to one serial, hence unique().
+  const disconnectSerials = unique(
+    lanRows
+      .filter(
+        (r) => isRowChecked(r) && !!r.conn && r.conn.device_type !== 'usb' && r.conn.device_type !== 'emulator'
+      )
+      .map((r) => r.conn!.serial)
+  );
 
-    setIsConnectingAll(true);
+  const handleConnectSelected = async () => {
+    const hosts = connectHosts;
+    if (hosts.length === 0 || lanAction !== null || isSending) return;
+
+    setLanStatus(null);
+    setLanAction('connect');
     setConnectingHosts((prev) => {
       const next = new Set(prev);
-      toConnect.forEach((h) => next.add(h));
+      hosts.forEach((h) => next.add(h));
       return next;
     });
 
     try {
-      const connected = await invoke<string[]>('connect_lan_devices', { hosts: toConnect });
-      const connectedSet = new Set(connected);
-      const failed = toConnect.filter((h) => !connectedSet.has(h));
+      const connected = await invoke<string[]>('connect_lan_devices', { hosts });
+      const okSet = new Set(connected);
+      const failed = hosts.filter((h) => !okSet.has(h));
+      const okCount = hosts.length - failed.length;
+      const pairingHint = failed.some((h) => !h.endsWith(':5555'))
+        ? ' Для Android 11+ может понадобиться сопряжение — кнопка с ключом.'
+        : '';
       if (failed.length === 0) {
-        setInfoMsg(`Подключено устройств: ${connected.length} из ${toConnect.length}. Все выбраны получателями.`);
+        setLanStatus({ kind: 'success', text: `Подключено: ${okCount} из ${hosts.length}.` });
+      } else if (okCount > 0) {
+        setLanStatus({
+          kind: 'warning',
+          text: `Подключено: ${okCount} из ${hosts.length}. Не удалось: ${failed.join(', ')}.${pairingHint}`,
+        });
       } else {
-        setInfoMsg(connected.length > 0 ? `Подключено устройств: ${connected.length} из ${toConnect.length}.` : null);
-        const needsPairing = failed.some((h) => !h.endsWith(':5555'));
-        setErrorMsg(
-          `Не удалось подключить: ${failed.join(', ')}.` +
-            (needsPairing ? ' Для Android 11+ может потребоваться сопряжение по коду.' : '')
-        );
+        setLanStatus({ kind: 'error', text: `Не удалось подключить: ${failed.join(', ')}.${pairingHint}` });
       }
     } catch (err: any) {
-      setErrorMsg(`Ошибка подключения LAN-устройств: ${err}`);
+      setLanStatus({ kind: 'error', text: `Ошибка подключения: ${err}` });
     } finally {
       setConnectingHosts((prev) => {
         const next = new Set(prev);
-        toConnect.forEach((h) => next.delete(h));
+        hosts.forEach((h) => next.delete(h));
         return next;
       });
-      setIsConnectingAll(false);
+      setLanAction(null);
       onRefreshConnectedDevices();
     }
   };
 
-  const handleConnectHost = async (hostId: string, e?: React.MouseEvent) => {
-    if (e) e.stopPropagation();
-    if (connectingHosts.has(hostId)) return;
-    setConnectingHosts((prev) => new Set(prev).add(hostId));
-    setErrorMsg(null);
+  const handleDisconnectSelected = async () => {
+    const serials = disconnectSerials;
+    if (serials.length === 0 || lanAction !== null || isSending) return;
+    const rowsSnapshot = lanRows;
+
+    setLanStatus(null);
+    setLanAction('disconnect');
+    setDisconnectingSerials(new Set(serials));
+
     try {
-      await invoke('connect_device', { host: hostId });
-      onRefreshConnectedDevices();
-    } catch (err: any) {
-      const errStr = String(err || '');
-      setErrorMsg(`Не удалось подключить ${hostId}: ${errStr}`);
-      const lower = errStr.toLowerCase();
-      // If connection fails due to authentication or pairing needed, automatically trigger PairingModal
-      if (
-        lower.includes('сопряжен') ||
-        lower.includes('failed to connect') ||
-        lower.includes('unable to connect') ||
-        lower.includes('cannot connect')
-      ) {
-        const ip = hostId.split(':')[0];
-        setPairingTarget({ host: `${ip}:`, connectHost: hostId });
+      const results = await Promise.allSettled(
+        serials.map((serial) => invoke<string>('disconnect_device', { serial }))
+      );
+      const okSerials = serials.filter((_, i) => results[i].status === 'fulfilled');
+      const failedSerials = serials.filter((_, i) => results[i].status === 'rejected');
+
+      // Uncheck disconnected devices: an unconnected LAN target would otherwise be silently reconnected
+      // by the next transfer. Devices that failed to disconnect stay checked.
+      if (okSerials.length > 0) {
+        const okSet = new Set(okSerials);
+        setSelectedTargetIds((prev) => {
+          const next = new Set(prev);
+          rowsSnapshot.forEach((r) => {
+            if (r.conn && okSet.has(r.conn.serial)) {
+              next.delete(r.conn.serial);
+              next.delete(r.hostId);
+            }
+          });
+          return next;
+        });
+      }
+
+      if (failedSerials.length === 0) {
+        setLanStatus({ kind: 'success', text: `Отключено: ${okSerials.length}.` });
+      } else if (okSerials.length > 0) {
+        setLanStatus({
+          kind: 'warning',
+          text: `Отключено: ${okSerials.length} из ${serials.length}. Не удалось: ${failedSerials.join(', ')}.`,
+        });
+      } else {
+        setLanStatus({ kind: 'error', text: `Не удалось отключить: ${failedSerials.join(', ')}.` });
       }
     } finally {
-      setConnectingHosts((prev) => {
-        const next = new Set(prev);
-        next.delete(hostId);
-        return next;
-      });
+      setDisconnectingSerials(new Set());
+      setLanAction(null);
+      onRefreshConnectedDevices();
     }
   };
 
@@ -333,6 +453,13 @@ export const TransferView: React.FC<TransferViewProps> = ({
     if (!pairingTarget) return;
     const targetToConnect = pairingTarget.connectHost;
     setPairingTarget(null);
+
+    // Pairing-only endpoint: the connect port is announced separately, so just refresh and rescan
+    if (targetToConnect === null) {
+      onRefreshConnectedDevices();
+      onScanNetwork();
+      return;
+    }
 
     try {
       await invoke('connect_device', { host: targetToConnect });
@@ -343,12 +470,23 @@ export const TransferView: React.FC<TransferViewProps> = ({
     }
   };
 
-  // Sync selected target if deviceSerial changes from outside and nothing was selected
+  // Auto-check the sidebar's device only when one appears after there was none. When the active device
+  // gets disconnected, App falls back to another device, which must not be checked silently.
+  const prevDeviceSerialRef = useRef<string | null>(deviceSerial);
   useEffect(() => {
-    if (deviceSerial && selectedTargetIds.size === 0) {
+    const prevSerial = prevDeviceSerialRef.current;
+    prevDeviceSerialRef.current = deviceSerial;
+    if (deviceSerial && prevSerial === null && selectedTargetIds.size === 0) {
       setSelectedTargetIds(new Set([deviceSerial]));
     }
   }, [deviceSerial]);
+
+  // Success messages hide themselves; warnings and errors stay until dismissed or the next action
+  useEffect(() => {
+    if (!lanStatus || lanStatus.kind !== 'success') return;
+    const timer = setTimeout(() => setLanStatus(null), 4000);
+    return () => clearTimeout(timer);
+  }, [lanStatus]);
 
   // Automatically prune dead/disconnected device IDs from selection
   useEffect(() => {
@@ -367,9 +505,14 @@ export const TransferView: React.FC<TransferViewProps> = ({
     });
   }, [directPcDevices, lanHosts]);
 
-  // Listen to multi-transfer-progress events from Rust backend
+  // Listen to multi-transfer-progress events from Rust backend. Subscribed once: onTransferTriggered is a
+  // new function on every App render, and re-subscribing each time leaked listeners whose cleanup ran
+  // before listen() resolved (and could miss events in between).
+  const onTransferTriggeredRef = useRef(onTransferTriggered);
+  onTransferTriggeredRef.current = onTransferTriggered;
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
+    let disposed = false;
 
     listen<MultiTransferDeviceProgress>('multi-transfer-progress', (event) => {
       const p = event.payload;
@@ -379,16 +522,18 @@ export const TransferView: React.FC<TransferViewProps> = ({
       }));
 
       if (p.status === 'completed') {
-        onTransferTriggered();
+        onTransferTriggeredRef.current();
       }
     }).then((unlisten) => {
-      unlistenFn = unlisten;
+      if (disposed) unlisten();
+      else unlistenFn = unlisten;
     });
 
     return () => {
+      disposed = true;
       if (unlistenFn) unlistenFn();
     };
-  }, [onTransferTriggered]);
+  }, []);
 
   const presets = [
     { label: 'Загрузки', path: '/sdcard/Download', icon: Download },
@@ -410,34 +555,42 @@ export const TransferView: React.FC<TransferViewProps> = ({
     });
   };
 
-  const selectAll = () => {
-    const next = new Set<string>();
-    directPcDevices.forEach((d) => next.add(d.serial));
-    lanHosts.forEach((h) => {
-      const id = getLanTargetId(h);
-      if (id) next.add(id);
+  // Tri-state group selection: master checkbox in the toolbar + one per column
+  const pcIds = directPcDevices.map((d) => d.serial);
+  const lanIds = unique(lanRows.map((r) => r.targetId).filter((id): id is string => id !== null));
+  const allIds = unique([...pcIds, ...lanIds]);
+
+  const getGroupState = (ids: string[]): GroupState => {
+    if (ids.length === 0) return 'none';
+    const checked = ids.filter((id) => selectedTargetIds.has(id)).length;
+    if (checked === 0) return 'none';
+    return checked === ids.length ? 'all' : 'some';
+  };
+
+  // All selected -> clear these ids, otherwise select all of them. Other groups stay untouched.
+  const toggleGroup = (ids: string[]) => {
+    if (ids.length === 0) return;
+    setSelectedTargetIds((prev) => {
+      const next = new Set(prev);
+      const allChecked = ids.every((id) => prev.has(id));
+      ids.forEach((id) => (allChecked ? next.delete(id) : next.add(id)));
+      return next;
     });
-    setSelectedTargetIds(next);
   };
 
-  const selectDirectPcOnly = () => {
-    const next = new Set<string>();
-    directPcDevices.forEach((d) => next.add(d.serial));
-    setSelectedTargetIds(next);
-  };
-
-  const selectLanOnly = () => {
-    const next = new Set<string>();
-    lanHosts.forEach((h) => {
-      const id = getLanTargetId(h);
-      if (id) next.add(id);
-    });
-    setSelectedTargetIds(next);
-  };
-
-  const deselectAll = () => {
-    setSelectedTargetIds(new Set());
-  };
+  // Toolbar «Подключить» / «Отключить» state (network devices only)
+  const lanBusy = lanAction !== null || isSending;
+  const connectTitle = isSending
+    ? 'Дождитесь окончания передачи'
+    : connectHosts.length > 0
+    ? `Подключить отмеченные устройства в локальной сети: ${connectHosts.length}. USB и эмуляторы не затрагиваются.`
+    : 'Отметьте неподключённые устройства в локальной сети';
+  const disconnectTitle = isSending
+    ? 'Дождитесь окончания передачи'
+    : disconnectSerials.length > 0
+    ? `Отключить отмеченные устройства в локальной сети: ${disconnectSerials.length}. USB и эмуляторы не затрагиваются. Сопряжённые устройства Android 11+ adb может переподключить автоматически.`
+    : 'Нет отмеченных подключённых устройств в локальной сети';
+  const lanStatusStyle = lanStatus ? LAN_STATUS_STYLES[lanStatus.kind] : null;
 
   // Build target list for backend, deduplicating targets
   const buildTargetDevices = (): TargetDevice[] => {
@@ -488,6 +641,12 @@ export const TransferView: React.FC<TransferViewProps> = ({
 
   // Start sending files to all selected devices
   const startPushing = async (paths: string[]) => {
+    // A checked device may be mid-connect/disconnect: pushing now would race the toolbar action
+    // (and silently reconnect devices that are being disconnected)
+    if (lanActionRef.current !== null) {
+      setErrorMsg('Дождитесь окончания подключения или отключения устройств.');
+      return;
+    }
     const targets = buildTargetDevices();
     if (targets.length === 0) {
       setErrorMsg('Пожалуйста, отметьте хотя бы одно устройство для отправки.');
@@ -497,7 +656,6 @@ export const TransferView: React.FC<TransferViewProps> = ({
 
     setIsSending(true);
     setErrorMsg(null);
-    setInfoMsg(null);
 
     // Reset multiProgress for newly targeted devices
     const initialProgress: Record<string, MultiTransferDeviceProgress> = {};
@@ -533,7 +691,8 @@ export const TransferView: React.FC<TransferViewProps> = ({
     try {
       const selected = await invoke<string[]>('pick_local_files');
       if (selected && selected.length > 0) {
-        startPushing(selected);
+        // Current render's function: the selection may have changed while the dialog was open
+        startPushingRef.current(selected);
       }
     } catch (e: any) {
       setErrorMsg(`Не удалось выбрать файлы: ${e}`);
@@ -544,7 +703,7 @@ export const TransferView: React.FC<TransferViewProps> = ({
     try {
       const selectedFolder = await invoke<string | null>('pick_local_folder');
       if (selectedFolder) {
-        startPushing([selectedFolder]);
+        startPushingRef.current([selectedFolder]);
       }
     } catch (e: any) {
       setErrorMsg(`Не удалось выбрать папку: ${e}`);
@@ -560,7 +719,7 @@ export const TransferView: React.FC<TransferViewProps> = ({
   const startPushingRef = useRef(startPushing);
   startPushingRef.current = startPushing;
   const canDropRef = useRef(false);
-  canDropRef.current = selectedCount > 0 && !isSending;
+  canDropRef.current = selectedCount > 0 && !isSending && lanAction === null;
   const isSendingRef = useRef(false);
   isSendingRef.current = isSending;
 
@@ -581,6 +740,8 @@ export const TransferView: React.FC<TransferViewProps> = ({
             setErrorMsg(
               isSendingRef.current
                 ? 'Дождитесь окончания текущей передачи.'
+                : lanActionRef.current !== null
+                ? 'Дождитесь окончания подключения или отключения устройств.'
                 : 'Отметьте хотя бы одно устройство-получатель перед перетаскиванием файлов.'
             );
             return;
@@ -652,115 +813,138 @@ export const TransferView: React.FC<TransferViewProps> = ({
         </div>
       </div>
 
-      {/* 2. Target Device Selection (Divided by Connected vs Local Network) */}
-      <div className="p-5 rounded-2xl bg-[#141724] border border-[#212738] shadow-sm space-y-4">
-        <div className="flex items-center justify-between pb-3 border-b border-[#1e2333]">
-          <div className="flex items-center gap-2">
-            <Layers className="w-4 h-4 text-sky-400" />
-            <span className="text-xs font-semibold text-[#f1f5f9]">
-              Получатели файлов ({selectedCount} выбрано)
-            </span>
+      {/* 2. Recipients: devices connected to the PC and devices in the local network */}
+      <div className="p-5 rounded-2xl bg-[#141724] border border-[#212738] shadow-sm space-y-3">
+        {/* Toolbar: master checkbox, selection count, bulk connect / disconnect of checked LAN devices */}
+        <div className="flex items-center justify-between gap-3 pb-3 border-b border-[#1e2333]">
+          <div className="flex items-center gap-2 min-w-0">
+            <GroupCheckbox
+              state={getGroupState(allIds)}
+              disabled={allIds.length === 0}
+              onToggle={() => toggleGroup(allIds)}
+              selectTitle="Выбрать все"
+              clearTitle="Снять выбор"
+            />
+            <span className="text-xs font-semibold text-[#f1f5f9] truncate">Получатели файлов</span>
+            <span className="text-[11px] text-[#7c879c] whitespace-nowrap tabular-nums">выбрано {selectedCount}</span>
           </div>
 
-          <div className="flex items-center gap-1.5 text-xs">
+          <div className="flex items-center gap-1.5 shrink-0">
             <button
-              onClick={selectAll}
-              className="px-2.5 py-1 rounded-lg bg-[#1a2030] hover:bg-sky-500/20 hover:text-sky-300 border border-[#273047] text-[11px] text-[#cbd5e1] transition"
+              type="button"
+              onClick={handleConnectSelected}
+              disabled={connectHosts.length === 0 || lanBusy}
+              title={connectTitle}
+              className={`${LAN_BUTTON_BASE} bg-emerald-500/10 border-emerald-500/25 text-emerald-300 hover:enabled:bg-emerald-500/20 hover:enabled:border-emerald-500/40`}
             >
-              Все
+              {lanAction === 'connect' ? (
+                <LoaderCircle className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Plug className="w-3.5 h-3.5" />
+              )}
+              <span>{lanAction === 'connect' ? 'Подключение…' : 'Подключить'}</span>
+              {lanAction !== 'connect' && connectHosts.length > 0 && (
+                <span className="min-w-4 px-1 rounded bg-emerald-500/20 text-[10px] font-mono tabular-nums text-center">
+                  {connectHosts.length}
+                </span>
+              )}
             </button>
             <button
-              onClick={selectDirectPcOnly}
-              className="px-2.5 py-1 rounded-lg bg-[#1a2030] hover:bg-sky-500/20 hover:text-sky-300 border border-[#273047] text-[11px] text-[#cbd5e1] transition"
+              type="button"
+              onClick={handleDisconnectSelected}
+              disabled={disconnectSerials.length === 0 || lanBusy}
+              title={disconnectTitle}
+              className={`${LAN_BUTTON_BASE} bg-[#1a2030] border-[#273047] text-[#cbd5e1] hover:enabled:bg-rose-500/15 hover:enabled:text-rose-300 hover:enabled:border-rose-500/30`}
             >
-              На компьютере
-            </button>
-            <button
-              onClick={selectLanOnly}
-              className="px-2.5 py-1 rounded-lg bg-[#1a2030] hover:bg-sky-500/20 hover:text-sky-300 border border-[#273047] text-[11px] text-[#cbd5e1] transition"
-            >
-              В сети LAN
-            </button>
-            <button
-              onClick={deselectAll}
-              className="px-2.5 py-1 rounded-lg bg-[#1a2030] hover:bg-rose-500/20 hover:text-rose-300 border border-[#273047] text-[11px] text-[#7c879c] transition"
-            >
-              Снять выбор
+              {lanAction === 'disconnect' ? (
+                <LoaderCircle className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Unplug className="w-3.5 h-3.5" />
+              )}
+              <span>{lanAction === 'disconnect' ? 'Отключение…' : 'Отключить'}</span>
+              {lanAction !== 'disconnect' && disconnectSerials.length > 0 && (
+                <span className="min-w-4 px-1 rounded bg-white/10 text-[10px] font-mono tabular-nums text-center">
+                  {disconnectSerials.length}
+                </span>
+              )}
             </button>
           </div>
         </div>
 
+        {/* Result of the last bulk LAN action */}
+        {lanStatus && lanStatusStyle && (
+          <div
+            className={`flex items-start gap-2 px-2.5 py-1.5 rounded-lg border text-[11px] leading-snug ${lanStatusStyle.tone}`}
+          >
+            <lanStatusStyle.Icon className="w-3.5 h-3.5 shrink-0 mt-px" />
+            <span className="flex-1 min-w-0 line-clamp-2 break-words" title={lanStatus.text}>
+              {lanStatus.text}
+            </span>
+            <button
+              type="button"
+              onClick={() => setLanStatus(null)}
+              title="Скрыть"
+              className="p-0.5 -m-0.5 rounded opacity-60 hover:opacity-100 hover:bg-white/5 transition"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {/* SECTION A: Connected directly to PC (USB + Emulators only) */}
-          <div className="p-3.5 bg-[#0f111a] rounded-xl border border-[#1e2333] space-y-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Smartphone className="w-3.5 h-3.5 text-sky-400" />
-                <span className="text-xs font-semibold text-[#f1f5f9]">
-                  Подключенные к компьютеру ({directPcDevices.length})
+          <div className="p-3.5 bg-[#0f111a] rounded-xl border border-[#1e2333] space-y-2.5 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <GroupCheckbox
+                  state={getGroupState(pcIds)}
+                  disabled={pcIds.length === 0}
+                  onToggle={() => toggleGroup(pcIds)}
+                  selectTitle="Выбрать все в колонке"
+                  clearTitle="Снять выбор в колонке"
+                />
+                <span className="text-xs font-semibold text-[#f1f5f9] truncate">
+                  Подключённые к ПК ({directPcDevices.length})
                 </span>
               </div>
               <button
+                type="button"
                 onClick={onRefreshConnectedDevices}
                 disabled={isRefreshingConnectedDevices}
-                className="text-[11px] text-sky-400 hover:text-sky-300 flex items-center gap-1 transition disabled:opacity-50"
-                title="Сканировать и обновить устройства, подключенные к ПК"
+                title="Обновить устройства, подключённые к ПК"
+                className="p-1 rounded-md text-sky-400 hover:text-sky-300 hover:bg-sky-500/10 transition disabled:opacity-50 shrink-0"
               >
-                <RefreshCw className={`w-3 h-3 ${isRefreshingConnectedDevices ? 'animate-spin' : ''}`} />
-                <span>Сканировать</span>
+                <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingConnectedDevices ? 'animate-spin' : ''}`} />
               </button>
             </div>
 
             {directPcDevices.length === 0 ? (
-              <div className="py-4 text-center text-xs text-[#64748b]">
-                Нет физических подключений (USB) или запущенных эмуляторов.
-              </div>
+              <div className="py-4 text-center text-xs text-[#64748b]">Нет USB-устройств и запущенных эмуляторов.</div>
             ) : (
-              <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+              <div className="@container space-y-1.5 max-h-48 overflow-y-auto pr-1">
                 {directPcDevices.map((d) => {
                   const isChecked = selectedTargetIds.has(d.serial);
                   const isEmulator = d.device_type === 'emulator';
+                  const TypeIcon = isEmulator ? Monitor : Usb;
+                  const typeLabel = isEmulator ? 'Эмулятор' : 'USB';
                   return (
                     <div
                       key={d.serial}
                       onClick={() => toggleDevice(d.serial)}
-                      className={`p-2.5 rounded-lg border cursor-pointer transition flex items-center justify-between ${
-                        isChecked
-                          ? isEmulator
-                            ? 'bg-indigo-500/15 border-indigo-500/40 text-[#f1f5f9]'
-                            : 'bg-sky-500/15 border-sky-500/40 text-[#f1f5f9]'
-                          : 'bg-[#151926] hover:bg-[#1a2030] border-[#222a3d] text-[#94a3b8]'
-                      }`}
+                      className={`${ROW_BASE} ${isChecked ? ROW_CHECKED : ROW_UNCHECKED}`}
                     >
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        {isChecked ? (
-                          <CheckSquare className={`w-4 h-4 shrink-0 ${isEmulator ? 'text-indigo-400' : 'text-sky-400'}`} />
-                        ) : (
-                          <Square className="w-4 h-4 text-[#475569] shrink-0" />
-                        )}
-                        <div className="min-w-0">
-                          <div className="text-xs font-medium truncate text-[#f1f5f9]">
-                            {d.model || d.serial}
-                          </div>
-                          <div className="text-[10px] text-[#64748b] font-mono truncate">
-                            {d.serial}
-                          </div>
-                        </div>
+                      {isChecked ? (
+                        <CheckSquare className="w-4 h-4 text-sky-400 shrink-0" />
+                      ) : (
+                        <Square className="w-4 h-4 text-[#475569] shrink-0" />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-medium text-[#f1f5f9] truncate">{d.model || d.serial}</div>
+                        <div className="text-[10px] text-[#64748b] font-mono truncate">{d.serial}</div>
                       </div>
-
-                      <span
-                        className={`text-[10px] px-2 py-0.5 rounded-full font-medium shrink-0 flex items-center gap-1 ${
-                          isEmulator
-                            ? 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/30'
-                            : 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
-                        }`}
-                      >
-                        {isEmulator ? (
-                          <Monitor className="w-2.5 h-2.5" />
-                        ) : (
-                          <Usb className="w-2.5 h-2.5" />
-                        )}
-                        {isEmulator ? 'Эмулятор' : 'USB'}
+                      <span className="flex items-center gap-1 text-[10px] text-[#7c879c] shrink-0" title={typeLabel}>
+                        <TypeIcon className="w-3 h-3" />
+                        <span className="hidden @[19rem]:inline">{typeLabel}</span>
                       </span>
                     </div>
                   );
@@ -769,141 +953,117 @@ export const TransferView: React.FC<TransferViewProps> = ({
             )}
           </div>
 
-          {/* SECTION B: Discovered in LAN (Retains connected devices with status badge) */}
-          <div className="p-3.5 bg-[#0f111a] rounded-xl border border-[#1e2333] space-y-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Radio className="w-3.5 h-3.5 text-indigo-400" />
-                <span className="text-xs font-semibold text-[#f1f5f9] whitespace-nowrap">
-                  В локальной сети ({lanHosts.length})
+          {/* SECTION B: Discovered in LAN (keeps connected devices, with a status dot) */}
+          <div className="p-3.5 bg-[#0f111a] rounded-xl border border-[#1e2333] space-y-2.5 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <GroupCheckbox
+                  state={getGroupState(lanIds)}
+                  disabled={lanIds.length === 0}
+                  onToggle={() => toggleGroup(lanIds)}
+                  selectTitle="Выбрать все в колонке"
+                  clearTitle="Снять выбор в колонке"
+                />
+                <span className="text-xs font-semibold text-[#f1f5f9] truncate">
+                  Локальная сеть ({lanHosts.length})
                 </span>
               </div>
-              <div className="flex items-center gap-2.5">
-                <button
-                  onClick={handleSelectAndConnectAllLan}
-                  disabled={isConnectingAll || isScanningNetwork || lanHosts.length === 0}
-                  className="px-2 py-0.5 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap shrink-0 transition disabled:opacity-50"
-                  title="Отметить все устройства в сети получателями и подключиться к неподключённым одним нажатием"
-                >
-                  {isConnectingAll ? (
-                    <RefreshCw className="w-3 h-3 animate-spin" />
-                  ) : (
-                    <PlugZap className="w-3 h-3" />
-                  )}
-                  <span>{isConnectingAll ? 'Подключение...' : 'Подключить все'}</span>
-                </button>
-                <button
-                  onClick={onScanNetwork}
-                  disabled={isScanningNetwork}
-                  className="text-[11px] text-sky-400 hover:text-sky-300 flex items-center gap-1 transition disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-3 h-3 ${isScanningNetwork ? 'animate-spin' : ''}`} />
-                  <span>Сканировать</span>
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={onScanNetwork}
+                disabled={isScanningNetwork}
+                title="Сканировать локальную сеть"
+                className="p-1 rounded-md text-sky-400 hover:text-sky-300 hover:bg-sky-500/10 transition disabled:opacity-50 shrink-0"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isScanningNetwork ? 'animate-spin' : ''}`} />
+              </button>
             </div>
 
-            {lanHosts.length === 0 ? (
+            {lanRows.length === 0 ? (
               <div className="py-4 text-center text-xs text-[#64748b]">
-                {isScanningNetwork
-                  ? 'Сканирование локальной сети...'
-                  : 'Устройства в сети не обнаружены. Нажмите «Сканировать».'}
+                {isScanningNetwork ? (
+                  'Сканирование локальной сети…'
+                ) : (
+                  <>
+                    Устройства в сети не найдены.{' '}
+                    <button type="button" onClick={onScanNetwork} className="text-sky-400 hover:text-sky-300">
+                      Сканировать снова
+                    </button>
+                  </>
+                )}
               </div>
             ) : (
-              <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                {lanHosts.map((h) => {
-                  const hostId = `${h.ip}:${h.port}`;
-                  const connectedDevice = findConnectedDeviceForHost(h);
-                  const isConnected = !!connectedDevice && connectedDevice.state === 'device';
-                  const isUnauthorized = !!connectedDevice && connectedDevice.state === 'unauthorized';
-                  const isOffline = !!connectedDevice && connectedDevice.state === 'offline';
+              <div className="@container space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                {lanRows.map((r) => {
+                  const { host: h, hostId, conn, targetId } = r;
+                  const isSelectable = targetId !== null;
+                  const isChecked = isRowChecked(r);
                   const isConnecting = connectingHosts.has(hostId);
-
-                  const targetId = connectedDevice ? connectedDevice.serial : hostId;
-                  const isChecked = selectedTargetIds.has(targetId);
+                  const isDisconnecting = !!conn && disconnectingSerials.has(conn.serial);
+                  const isPairingOnly = r.status === 'needsPairing';
+                  const view = LAN_ROW_VIEW[r.status];
+                  const showPairingButton = (!conn || conn.state === 'offline') && !isConnecting;
 
                   return (
                     <div
                       key={hostId}
-                      onClick={() => toggleDevice(targetId)}
-                      className={`p-2.5 rounded-lg border cursor-pointer transition flex items-center justify-between ${
-                        isChecked
-                          ? isConnected
-                            ? 'bg-emerald-500/15 border-emerald-500/40 text-[#f1f5f9]'
-                            : 'bg-indigo-500/15 border-indigo-500/40 text-[#f1f5f9]'
-                          : 'bg-[#151926] hover:bg-[#1a2030] border-[#222a3d] text-[#94a3b8]'
+                      onClick={targetId !== null ? () => toggleDevice(targetId) : undefined}
+                      title={isSelectable ? undefined : 'Сначала выполните сопряжение — кнопка с ключом'}
+                      className={`${ROW_BASE} ${
+                        !isSelectable ? ROW_DISABLED : isChecked ? ROW_CHECKED : ROW_UNCHECKED
                       }`}
                     >
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        {isChecked ? (
-                          <CheckSquare
-                            className={`w-4 h-4 shrink-0 ${isConnected ? 'text-emerald-400' : 'text-indigo-400'}`}
-                          />
-                        ) : (
-                          <Square className="w-4 h-4 text-[#475569] shrink-0" />
-                        )}
-                        <div className="min-w-0">
-                          <div className="text-xs font-medium truncate text-[#f1f5f9]">
-                            {connectedDevice ? (connectedDevice.model || connectedDevice.serial) : (h.name || hostId)}
-                          </div>
-                          <div className="text-[10px] text-[#64748b] font-mono truncate">
-                            {hostId}
-                          </div>
+                      {isChecked ? (
+                        <CheckSquare className="w-4 h-4 text-sky-400 shrink-0" />
+                      ) : (
+                        <Square className={`w-4 h-4 shrink-0 ${isSelectable ? 'text-[#475569]' : 'text-[#2b3347]'}`} />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-medium text-[#f1f5f9] truncate">
+                          {conn ? conn.model || conn.serial : h.name || hostId}
                         </div>
+                        <div className="text-[10px] text-[#64748b] font-mono truncate">{hostId}</div>
                       </div>
 
-                      <div className="flex items-center gap-2 shrink-0">
-                        {/* Traffic light status indicator */}
-                        {isConnecting ? (
-                          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium shrink-0 bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shadow-sm shadow-amber-400/50" />
-                            <span>Подключение...</span>
-                          </span>
-                        ) : isConnected ? (
-                          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium shrink-0 bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-emerald-400 shadow-sm shadow-emerald-400/50" />
-                            <span>Подключено</span>
-                          </span>
-                        ) : isUnauthorized ? (
-                          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium shrink-0 bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shadow-sm shadow-amber-400/50" />
-                            <span>Ожидает авторизации</span>
-                          </span>
-                        ) : isOffline ? (
-                          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium shrink-0 bg-rose-500/15 text-rose-300 border border-rose-500/30 flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-rose-500 shadow-sm shadow-rose-500/50" />
-                            <span>Офлайн</span>
-                          </span>
-                        ) : (
-                          <span className="text-[10px] px-2 py-0.5 rounded-full font-medium shrink-0 bg-rose-500/15 text-rose-300 border border-rose-500/30 flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-rose-500 shadow-sm shadow-rose-500/50" />
-                            <span>Не подключено</span>
-                          </span>
-                        )}
+                      {isConnecting ? (
+                        <span className="flex items-center gap-1.5 shrink-0 text-[10px]" title="Подключение…">
+                          <LoaderCircle className="w-3 h-3 animate-spin text-amber-400" />
+                          <span className="hidden @[19rem]:inline text-amber-300">Подключение…</span>
+                        </span>
+                      ) : isDisconnecting ? (
+                        <span className="flex items-center gap-1.5 shrink-0 text-[10px]" title="Отключение…">
+                          <LoaderCircle className="w-3 h-3 animate-spin text-[#94a3b8]" />
+                          <span className="hidden @[19rem]:inline text-[#94a3b8]">Отключение…</span>
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1.5 shrink-0 text-[10px]" title={view.tooltip}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${view.dot}`} />
+                          <span className={`hidden @[19rem]:inline ${view.textClass}`}>{view.text}</span>
+                        </span>
+                      )}
 
-                        {!connectedDevice && !isConnecting && (
-                          <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setPairingTarget({ host: `${h.ip}:`, connectHost: hostId });
-                              }}
-                              className="px-2 py-0.5 rounded-md bg-[#1c2233] hover:bg-amber-500/20 hover:text-amber-300 border border-[#2d364f] hover:border-amber-500/40 text-[10px] font-medium text-[#cbd5e1] transition flex items-center gap-1"
-                              title="Сопряжение по коду безопасности Android 11+"
-                            >
-                              <KeyRound className="w-3 h-3 text-amber-400" />
-                              <span>Сопряжение</span>
-                            </button>
-                            <button
-                              onClick={(e) => handleConnectHost(hostId, e)}
-                              className="px-2 py-0.5 rounded-md bg-[#1c2233] hover:bg-sky-500 hover:text-white border border-[#2d364f] hover:border-sky-500 text-[10px] font-medium text-[#cbd5e1] transition"
-                              title="Подключить устройство по Wi-Fi прямо сейчас"
-                            >
-                              Подключить
-                            </button>
-                          </div>
-                        )}
-                      </div>
+                      {showPairingButton && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            // Pairing endpoint: pair on its own port; the connect port is found by a rescan
+                            setPairingTarget(
+                              h.discovery_type === 'pairing'
+                                ? { host: hostId, connectHost: null }
+                                : { host: `${h.ip}:`, connectHost: hostId }
+                            );
+                          }}
+                          title="Сопряжение по коду (Android 11+)"
+                          className={`p-1 rounded-md border shrink-0 transition ${
+                            isPairingOnly
+                              ? 'bg-amber-500/10 border-amber-500/25 text-amber-300 hover:bg-amber-500/20'
+                              : 'border-transparent text-amber-400/70 hover:text-amber-300 hover:bg-amber-500/15 hover:border-amber-500/30'
+                          }`}
+                        >
+                          <KeyRound className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -951,7 +1111,7 @@ export const TransferView: React.FC<TransferViewProps> = ({
         <div className="flex items-center gap-3">
           <button
             onClick={handlePickFiles}
-            disabled={selectedCount === 0 || isSending}
+            disabled={selectedCount === 0 || isSending || lanAction !== null}
             className="px-5 py-2.5 bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-white rounded-xl text-xs font-semibold transition flex items-center gap-2 shadow-lg shadow-sky-500/20 active:scale-95"
           >
             <FilePlus className="w-4 h-4" />
@@ -959,7 +1119,7 @@ export const TransferView: React.FC<TransferViewProps> = ({
           </button>
           <button
             onClick={handlePickFolder}
-            disabled={selectedCount === 0 || isSending}
+            disabled={selectedCount === 0 || isSending || lanAction !== null}
             className="px-5 py-2.5 bg-[#1b2132] hover:bg-[#252c42] disabled:opacity-50 text-[#cbd5e1] rounded-xl text-xs font-semibold transition flex items-center gap-2 border border-[#2d364f] active:scale-95"
           >
             <FolderPlus className="w-4 h-4" />
@@ -973,13 +1133,6 @@ export const TransferView: React.FC<TransferViewProps> = ({
           </div>
         )}
       </div>
-
-      {infoMsg && (
-        <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs flex items-center gap-2.5">
-          <CheckCircle2 className="w-4 h-4 shrink-0" />
-          <span>{infoMsg}</span>
-        </div>
-      )}
 
       {errorMsg && (
         <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center gap-2.5">
