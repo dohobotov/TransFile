@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import {
   DeviceInfo,
   DiscoveredHost,
@@ -33,6 +34,7 @@ import {
   Smartphone,
   Monitor,
   KeyRound,
+  PlugZap,
 } from 'lucide-react';
 import { PairingModal } from './PairingModal';
 
@@ -70,6 +72,8 @@ export const TransferView: React.FC<TransferViewProps> = ({
   const [isDragOver, setIsDragOver] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [infoMsg, setInfoMsg] = useState<string | null>(null);
+  const [isConnectingAll, setIsConnectingAll] = useState(false);
 
   // Set of selected target IDs (serial for connected, "ip:port" for unconnected network)
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(() => {
@@ -218,6 +222,82 @@ export const TransferView: React.FC<TransferViewProps> = ({
     );
   };
 
+  // LAN target id: serial of the active connection, otherwise "ip:port".
+  // Pairing-only endpoints (Android 11+ "_adb-tls-pairing") can't receive files until paired, so they are
+  // excluded from bulk selection/connection unless the device is already connected on another port.
+  const getLanTargetId = (h: DiscoveredHost): string | null => {
+    const connectedMatch = findConnectedDeviceForHost(h);
+    if (connectedMatch) return connectedMatch.serial;
+    if (h.discovery_type === 'pairing') return null;
+    return `${h.ip}:${h.port}`;
+  };
+
+  // One click: mark every LAN device as a recipient and connect all not-yet-connected ones in parallel
+  const handleSelectAndConnectAllLan = async () => {
+    if (isConnectingAll) return;
+    setErrorMsg(null);
+    setInfoMsg(null);
+
+    setSelectedTargetIds((prev) => {
+      const next = new Set(prev);
+      lanHosts.forEach((h) => {
+        const id = getLanTargetId(h);
+        if (id) next.add(id);
+      });
+      return next;
+    });
+
+    const toConnect = lanHosts
+      .filter((h) => {
+        if (h.discovery_type === 'pairing') return false;
+        const c = findConnectedDeviceForHost(h);
+        return !c || c.state === 'offline';
+      })
+      .map((h) => `${h.ip}:${h.port}`);
+
+    if (toConnect.length === 0) {
+      setInfoMsg(
+        lanHosts.length === 0
+          ? 'В сети не найдено устройств. Нажмите «Сканировать».'
+          : 'Все устройства LAN уже подключены и выбраны.'
+      );
+      return;
+    }
+
+    setIsConnectingAll(true);
+    setConnectingHosts((prev) => {
+      const next = new Set(prev);
+      toConnect.forEach((h) => next.add(h));
+      return next;
+    });
+
+    try {
+      const connected = await invoke<string[]>('connect_lan_devices', { hosts: toConnect });
+      const connectedSet = new Set(connected);
+      const failed = toConnect.filter((h) => !connectedSet.has(h));
+      if (failed.length === 0) {
+        setInfoMsg(`Подключено устройств: ${connected.length} из ${toConnect.length}. Все выбраны получателями.`);
+      } else {
+        setInfoMsg(connected.length > 0 ? `Подключено устройств: ${connected.length} из ${toConnect.length}.` : null);
+        const needsPairing = failed.some((h) => !h.endsWith(':5555'));
+        setErrorMsg(
+          `Не удалось подключить: ${failed.join(', ')}.` +
+            (needsPairing ? ' Для Android 11+ может потребоваться сопряжение по коду.' : '')
+        );
+      }
+    } catch (err: any) {
+      setErrorMsg(`Ошибка подключения LAN-устройств: ${err}`);
+    } finally {
+      setConnectingHosts((prev) => {
+        const next = new Set(prev);
+        toConnect.forEach((h) => next.delete(h));
+        return next;
+      });
+      setIsConnectingAll(false);
+      onRefreshConnectedDevices();
+    }
+  };
+
   const handleConnectHost = async (hostId: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     if (connectingHosts.has(hostId)) return;
@@ -334,8 +414,8 @@ export const TransferView: React.FC<TransferViewProps> = ({
     const next = new Set<string>();
     directPcDevices.forEach((d) => next.add(d.serial));
     lanHosts.forEach((h) => {
-      const connectedMatch = findConnectedDeviceForHost(h);
-      next.add(connectedMatch ? connectedMatch.serial : `${h.ip}:${h.port}`);
+      const id = getLanTargetId(h);
+      if (id) next.add(id);
     });
     setSelectedTargetIds(next);
   };
@@ -349,8 +429,8 @@ export const TransferView: React.FC<TransferViewProps> = ({
   const selectLanOnly = () => {
     const next = new Set<string>();
     lanHosts.forEach((h) => {
-      const connectedMatch = findConnectedDeviceForHost(h);
-      next.add(connectedMatch ? connectedMatch.serial : `${h.ip}:${h.port}`);
+      const id = getLanTargetId(h);
+      if (id) next.add(id);
     });
     setSelectedTargetIds(next);
   };
@@ -391,7 +471,7 @@ export const TransferView: React.FC<TransferViewProps> = ({
           });
           addedIds.add(connectedMatch.serial);
           addedIds.add(hostId);
-        } else if (!addedIds.has(hostId)) {
+        } else if (!addedIds.has(hostId) && h.discovery_type !== 'pairing') {
           targets.push({
             id: hostId,
             name: h.name || hostId,
@@ -417,6 +497,7 @@ export const TransferView: React.FC<TransferViewProps> = ({
 
     setIsSending(true);
     setErrorMsg(null);
+    setInfoMsg(null);
 
     // Reset multiProgress for newly targeted devices
     const initialProgress: Record<string, MultiTransferDeviceProgress> = {};
@@ -473,6 +554,50 @@ export const TransferView: React.FC<TransferViewProps> = ({
   const selectedTargets = buildTargetDevices();
   const selectedCount = selectedTargets.length;
   const multiProgressList = Object.values(multiProgress);
+
+  // Native drag & drop. Tauri intercepts OS file drops, so the HTML onDrop handler never receives file
+  // paths; the webview drag-drop event does. Refs keep the once-registered listener on current state.
+  const startPushingRef = useRef(startPushing);
+  startPushingRef.current = startPushing;
+  const canDropRef = useRef(false);
+  canDropRef.current = selectedCount > 0 && !isSending;
+  const isSendingRef = useRef(false);
+  isSendingRef.current = isSending;
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const p = event.payload;
+        if (p.type === 'enter' || p.type === 'over') {
+          setIsDragOver(true);
+        } else if (p.type === 'leave') {
+          setIsDragOver(false);
+        } else if (p.type === 'drop') {
+          setIsDragOver(false);
+          if (!canDropRef.current) {
+            setErrorMsg(
+              isSendingRef.current
+                ? 'Дождитесь окончания текущей передачи.'
+                : 'Отметьте хотя бы одно устройство-получатель перед перетаскиванием файлов.'
+            );
+            return;
+          }
+          if (p.paths.length > 0) startPushingRef.current(p.paths);
+        }
+      })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      });
+
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#0d0f17] overflow-y-auto p-6 space-y-6">
@@ -649,18 +774,33 @@ export const TransferView: React.FC<TransferViewProps> = ({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Radio className="w-3.5 h-3.5 text-indigo-400" />
-                <span className="text-xs font-semibold text-[#f1f5f9]">
-                  Обнаруженные в локальной сети ({lanHosts.length})
+                <span className="text-xs font-semibold text-[#f1f5f9] whitespace-nowrap">
+                  В локальной сети ({lanHosts.length})
                 </span>
               </div>
-              <button
-                onClick={onScanNetwork}
-                disabled={isScanningNetwork}
-                className="text-[11px] text-sky-400 hover:text-sky-300 flex items-center gap-1 transition disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3 h-3 ${isScanningNetwork ? 'animate-spin' : ''}`} />
-                <span>Сканировать</span>
-              </button>
+              <div className="flex items-center gap-2.5">
+                <button
+                  onClick={handleSelectAndConnectAllLan}
+                  disabled={isConnectingAll || isScanningNetwork || lanHosts.length === 0}
+                  className="px-2 py-0.5 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-[11px] font-medium flex items-center gap-1 whitespace-nowrap shrink-0 transition disabled:opacity-50"
+                  title="Отметить все устройства в сети получателями и подключиться к неподключённым одним нажатием"
+                >
+                  {isConnectingAll ? (
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <PlugZap className="w-3 h-3" />
+                  )}
+                  <span>{isConnectingAll ? 'Подключение...' : 'Подключить все'}</span>
+                </button>
+                <button
+                  onClick={onScanNetwork}
+                  disabled={isScanningNetwork}
+                  className="text-[11px] text-sky-400 hover:text-sky-300 flex items-center gap-1 transition disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3 h-3 ${isScanningNetwork ? 'animate-spin' : ''}`} />
+                  <span>Сканировать</span>
+                </button>
+              </div>
             </div>
 
             {lanHosts.length === 0 ? (
@@ -833,6 +973,13 @@ export const TransferView: React.FC<TransferViewProps> = ({
           </div>
         )}
       </div>
+
+      {infoMsg && (
+        <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs flex items-center gap-2.5">
+          <CheckCircle2 className="w-4 h-4 shrink-0" />
+          <span>{infoMsg}</span>
+        </div>
+      )}
 
       {errorMsg && (
         <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center gap-2.5">

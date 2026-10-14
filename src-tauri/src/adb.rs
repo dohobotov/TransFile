@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tauri::{AppHandle, Emitter, Manager};
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,93 +109,63 @@ pub fn invalidate_device_files_cache(serial: &str, path: Option<&str>) {
 }
 
 
-// Find ADB binary in local dir, system PATH, or user defined
+#[cfg(target_os = "windows")]
+const ADB_FILE_NAME: &str = "adb.exe";
+#[cfg(not(target_os = "windows"))]
+const ADB_FILE_NAME: &str = "adb";
+
+// Find ADB binary: user defined path, bundled copy next to the executable, system PATH, Android SDK.
+// The current working directory is deliberately never searched: a planted adb.exe in e.g. Downloads
+// would otherwise be executed on every launch.
 pub fn find_adb_path() -> Result<PathBuf, String> {
     if let Ok(guard) = CUSTOM_ADB_PATH.lock() {
         if let Some(ref path) = *guard {
-            if path.exists() {
+            if path.is_file() {
                 return Ok(path.clone());
             }
         }
     }
 
-    // Check application directory or relative paths
-    let candidate_paths = [
-        PathBuf::from("bin/adb.exe"),
-        PathBuf::from("bin/adb"),
-        PathBuf::from("./adb.exe"),
-        PathBuf::from("./adb"),
-        PathBuf::from("platform-tools/adb.exe"),
-        PathBuf::from("../bin/adb.exe"),
-    ];
-
-    for candidate in candidate_paths.iter() {
-        if candidate.exists() {
-            if let Ok(abs) = candidate.canonicalize() {
-                return Ok(abs);
-            }
-            return Ok(candidate.clone());
-        }
-    }
-
-    // Check current exe directory
+    // Bundled copy next to the current executable (installer / portable / tauri dev layouts)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            let in_exe_dir = exe_dir.join("bin").join("adb.exe");
-            if in_exe_dir.exists() {
-                return Ok(in_exe_dir);
-            }
-            let in_up_bin = exe_dir.join("_up_").join("bin").join("adb.exe");
-            if in_up_bin.exists() {
-                return Ok(in_up_bin);
-            }
-            let direct_in_exe_dir = exe_dir.join("adb.exe");
-            if direct_in_exe_dir.exists() {
-                return Ok(direct_in_exe_dir);
-            }
-            let in_resources_bin = exe_dir.join("resources").join("bin").join("adb.exe");
-            if in_resources_bin.exists() {
-                return Ok(in_resources_bin);
-            }
-            let in_resources = exe_dir.join("resources").join("adb.exe");
-            if in_resources.exists() {
-                return Ok(in_resources);
-            }
-        }
-    }
-
-    // Check system PATH
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = Command::new("where").arg("adb").output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = PathBuf::from(first_line.trim());
-                    if path.exists() {
-                        return Ok(path);
-                    }
+            let candidates = [
+                exe_dir.join("bin").join(ADB_FILE_NAME),
+                exe_dir.join("_up_").join("bin").join(ADB_FILE_NAME),
+                exe_dir.join("resources").join("bin").join(ADB_FILE_NAME),
+                exe_dir.join("resources").join(ADB_FILE_NAME),
+                exe_dir.join(ADB_FILE_NAME),
+            ];
+            for candidate in candidates {
+                if candidate.is_file() {
+                    return Ok(candidate);
                 }
             }
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    // Development builds and `cargo test`: repository bin/ folder (absolute, resolved at compile time)
+    #[cfg(debug_assertions)]
     {
-        if let Ok(output) = Command::new("which").arg("adb").output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = PathBuf::from(first_line.trim());
-                    if path.exists() {
-                        return Ok(path);
-                    }
-                }
+        let repo_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("bin").join(ADB_FILE_NAME);
+        if repo_bin.is_file() {
+            return Ok(repo_bin);
+        }
+    }
+
+    // System PATH (only absolute entries, so "." or empty entries can't point at the working directory)
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let candidate = dir.join(ADB_FILE_NAME);
+            if candidate.is_file() {
+                return Ok(candidate);
             }
         }
     }
 
-    // Common Windows directories
     // Check system Android SDK
     #[cfg(target_os = "windows")]
     {
@@ -211,38 +182,6 @@ pub fn find_adb_path() -> Result<PathBuf, String> {
 
 pub fn quote_posix_path(p: &str) -> String {
     format!("'{}'", p.replace('\'', "'\\''"))
-}
-
-pub fn execute_adb_command(args: &[&str]) -> Result<String, String> {
-    let adb_path = find_adb_path()?;
-    
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-    
-    let mut cmd = Command::new(&adb_path);
-    cmd.args(args);
-    
-    #[cfg(target_os = "windows")]
-    {
-        // CREATE_NO_WINDOW = 0x08000000 to prevent flashing cmd prompts
-        cmd.creation_flags(0x08000000);
-    }
-
-    let output = cmd.output().map_err(|e| format!("Ошибка выполнения ADB: {}", e))?;
-    
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        let err_text = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else {
-            stdout.trim().to_string()
-        };
-        return Err(err_text);
-    }
-
-    Ok(stdout)
 }
 
 pub async fn execute_adb_command_async(args: &[&str], timeout_secs: u64) -> Result<String, String> {
@@ -278,23 +217,69 @@ pub async fn execute_adb_command_async(args: &[&str], timeout_secs: u64) -> Resu
 }
 
 #[tauri::command]
-pub fn check_adb_status() -> Result<String, String> {
+pub async fn check_adb_status() -> Result<String, String> {
     let path = find_adb_path()?;
-    let version_out = execute_adb_command(&["version"])?;
+    let version_out = execute_adb_command_async(&["version"], 10).await?;
     let first_line = version_out.lines().next().unwrap_or("Android Debug Bridge").to_string();
     Ok(format!("{} ({})", first_line, path.display()))
 }
 
+const CUSTOM_ADB_PATH_FILE: &str = "adb_path.txt";
+
+fn custom_adb_path_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join(CUSTOM_ADB_PATH_FILE))
+}
+
+/// Restores the user-selected adb path saved by `set_custom_adb_path` (called once at startup).
+pub fn load_custom_adb_path(app: &AppHandle) {
+    let Some(file) = custom_adb_path_file(app) else { return };
+    let Ok(saved) = std::fs::read_to_string(&file) else { return };
+    let p = PathBuf::from(saved.trim());
+    if p.is_absolute() && p.is_file() {
+        if let Ok(mut guard) = CUSTOM_ADB_PATH.lock() {
+            *guard = Some(p);
+        }
+    }
+}
+
 #[tauri::command]
-pub fn set_custom_adb_path(path: String) -> Result<String, String> {
-    let p = PathBuf::from(&path);
-    if !p.exists() {
+pub async fn set_custom_adb_path(app: AppHandle, path: String) -> Result<String, String> {
+    let p = PathBuf::from(path.trim());
+    if !p.is_absolute() || !p.is_file() {
         return Err("Указанный файл не существует".to_string());
     }
-    if let Ok(mut guard) = CUSTOM_ADB_PATH.lock() {
-        *guard = Some(p.clone());
+    let is_adb_name = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().eq_ignore_ascii_case("adb"))
+        .unwrap_or(false);
+    if !is_adb_name {
+        return Err("Выберите исполняемый файл adb (adb.exe)".to_string());
     }
-    check_adb_status()
+
+    let previous = CUSTOM_ADB_PATH.lock().map_err(|e| e.to_string())?.replace(p.clone());
+
+    // Make sure the chosen binary really is ADB; otherwise roll back to the previous setting
+    let status = match check_adb_status().await {
+        Ok(s) if s.contains("Android Debug Bridge") => s,
+        other => {
+            if let Ok(mut guard) = CUSTOM_ADB_PATH.lock() {
+                *guard = previous;
+            }
+            return Err(match other {
+                Err(e) => format!("Файл не является рабочим ADB: {}", e),
+                Ok(_) => "Файл не является рабочим ADB".to_string(),
+            });
+        }
+    };
+
+    if let Some(file) = custom_adb_path_file(&app) {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&file, p.to_string_lossy().as_bytes());
+    }
+
+    Ok(status)
 }
 
 pub fn get_local_listening_ports_with_pids() -> (HashSet<u16>, HashMap<u16, u32>) {
@@ -304,7 +289,9 @@ pub fn get_local_listening_ports_with_pids() -> (HashSet<u16>, HashMap<u16, u32>
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("netstat");
+        // Absolute path: a bare "netstat" would also be looked up in the application directory
+        let system_root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let mut cmd = Command::new(system_root.join("System32").join("NETSTAT.EXE"));
         cmd.args(&["-ano", "-p", "tcp"]);
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         if let Ok(output) = cmd.output() {
@@ -343,11 +330,6 @@ pub fn get_local_listening_ports_with_pids() -> (HashSet<u16>, HashMap<u16, u32>
     }
 
     (ports, port_to_pid)
-}
-
-#[allow(dead_code)]
-pub fn get_local_listening_ports() -> HashSet<u16> {
-    get_local_listening_ports_with_pids().0
 }
 
 /// Checks whether a given TCP port matches known Android emulator patterns:
@@ -550,12 +532,6 @@ pub async fn auto_connect_unconnected_emulators(
     connected_count
 }
 
-#[allow(dead_code)]
-pub async fn auto_connect_local_emulators() {
-    let (listening, port_to_pid) = get_local_listening_ports_with_pids();
-    let _ = auto_connect_unconnected_emulators(&[], &listening, &port_to_pid).await;
-}
-
 pub fn is_emulator_serial(serial: &str) -> bool {
     serial.starts_with("127.0.0.1:")
         || serial.starts_with("localhost:")
@@ -736,28 +712,30 @@ pub async fn get_connected_devices() -> Result<Vec<DeviceInfo>, String> {
         }
     }
 
-    // Prune or reconnect offline devices:
+    // Prune or reconnect offline devices (concurrently, so N offline devices don't add N * 2s to every refresh):
+    let mut offline_set = tokio::task::JoinSet::new();
     for offline in offline_serials {
-        if offline.starts_with("127.0.0.1:") {
-            if let Some(port_str) = offline.strip_prefix("127.0.0.1:") {
-                if let Ok(port) = port_str.parse::<u16>() {
+        let action = if let Some(port_str) = offline.strip_prefix("127.0.0.1:") {
+            match port_str.parse::<u16>() {
+                Ok(port) => {
                     let is_mumu_16xxx = (16384..=20480).contains(&port) && (port - 16384) % 32 == 0;
                     let is_mirror_port = port_to_pid.get(&port).map_or(false, |pid| mumu_16xxx_pids.contains(pid)) && !is_mumu_16xxx;
-
-                    if !listening_ports.contains(&port) || is_mirror_port {
-                        // Port is no longer listening in OS, or is a redundant mirror port: disconnect!
-                        let _ = execute_adb_command_async(&["disconnect", &offline], 2).await;
-                    } else {
-                        // Port is still listening in OS! Try to reconnect it
-                        let _ = execute_adb_command_async(&["connect", &offline], 2).await;
-                    }
+                    // Port no longer listening or a redundant mirror port: disconnect; otherwise reconnect
+                    if !listening_ports.contains(&port) || is_mirror_port { "disconnect" } else { "connect" }
                 }
+                Err(_) => continue,
             }
         } else if offline.contains(':') {
             // Remote Wi-Fi/LAN device: attempt reconnection so transient disconnects recover
-            let _ = execute_adb_command_async(&["connect", &offline], 2).await;
-        }
+            "connect"
+        } else {
+            continue;
+        };
+        offline_set.spawn(async move {
+            let _ = execute_adb_command_async(&[action, &offline], 2).await;
+        });
     }
+    while offline_set.join_next().await.is_some() {}
 
     // 2. Auto-connect ONLY unconnected local emulators that are listening
     let new_connected = auto_connect_unconnected_emulators(&initial_serials, &listening_ports, &port_to_pid).await;
@@ -947,8 +925,10 @@ pub async fn connect_device(host: String) -> Result<String, String> {
     Ok(res.trim().to_string())
 }
 
+/// Connects to the given LAN hosts in parallel. Invoked only by an explicit user action
+/// ("Подключить все"); returns the hosts that are connected afterwards (including already connected ones).
 #[tauri::command]
-pub async fn auto_connect_lan_devices(hosts: Vec<String>) -> Result<Vec<String>, String> {
+pub async fn connect_lan_devices(hosts: Vec<String>) -> Result<Vec<String>, String> {
     if hosts.is_empty() {
         return Ok(Vec::new());
     }
@@ -972,6 +952,7 @@ pub async fn auto_connect_lan_devices(hosts: Vec<String>) -> Result<Vec<String>,
 
     // 2. Filter and normalize candidate hosts
     let mut candidate_hosts = Vec::new();
+    let mut already_connected = Vec::new();
     let mut seen = HashSet::new();
 
     for raw_host in hosts {
@@ -996,18 +977,21 @@ pub async fn auto_connect_lan_devices(hosts: Vec<String>) -> Result<Vec<String>,
             continue;
         }
 
-        // Filter out hosts already connected
-        if connected_serials.contains(&host) {
+        if !seen.insert(host.clone()) {
             continue;
         }
 
-        if seen.insert(host.clone()) {
+        // Hosts already connected need no new connection attempt
+        if connected_serials.contains(&host) {
+            already_connected.push(host);
+        } else {
             candidate_hosts.push(host);
         }
     }
 
     if candidate_hosts.is_empty() {
-        return Ok(Vec::new());
+        already_connected.sort();
+        return Ok(already_connected);
     }
 
     // 3. Connect candidate hosts concurrently with a concurrency limit of 8
@@ -1043,7 +1027,7 @@ pub async fn auto_connect_lan_devices(hosts: Vec<String>) -> Result<Vec<String>,
         });
     }
 
-    let mut successfully_connected = Vec::new();
+    let mut successfully_connected = already_connected;
     while let Some(res) = set.join_next().await {
         if let Ok(Some(host)) = res {
             successfully_connected.push(host);
@@ -1127,15 +1111,22 @@ pub fn is_directory_item(perms: &str, name: &str, symlink_target: Option<&str>) 
 }
 
 pub fn parse_ls_output(output: &str, query_path: &str) -> Vec<RemoteFileItem> {
+    // The name is everything after the single space that follows the timestamp. It must NOT be trimmed:
+    // "Photos " and "Photos" are different directories, and trimming would make actions on the first
+    // one (including delete) hit the second.
     static LS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"^([d\-lspcb][rwx\-stST]{9})\s+\d+\s+\S+\s+\S+\s+(\d+)?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}|\w{3}\s+\d+\s+[\d:]{4,5})\s+(.+)$").unwrap()
+        Regex::new(r"^([d\-lspcb][rwx\-stST]{9})[.+@]?\s+\d+\s+\S+\s+\S+\s+(\d+)?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}|\w{3}\s+\d+\s+[\d:]{4,5}) (.+)$").unwrap()
+    });
+    static PERMS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^[d\-lspcb][rwx\-stST]{9}[.+@]?$").unwrap()
     });
 
     let mut items = Vec::new();
 
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("total ") {
+    for raw_line in output.lines() {
+        // Strip only the CR of CRLF output and indentation; trailing spaces belong to the file name
+        let line = raw_line.trim_end_matches('\r').trim_start();
+        if line.trim().is_empty() || line.starts_with("total ") {
             continue;
         }
 
@@ -1148,15 +1139,20 @@ pub fn parse_ls_output(output: &str, query_path: &str) -> Vec<RemoteFileItem> {
             let is_symlink = perms.starts_with('l');
             let (name, symlink_target) = if is_symlink {
                 if let Some(pos) = raw_name.find(" -> ") {
-                    let n = raw_name[..pos].trim().to_string();
-                    let target = raw_name[pos + 4..].trim().to_string();
+                    let n = raw_name[..pos].to_string();
+                    let target = raw_name[pos + 4..].to_string();
                     (n, Some(target))
                 } else {
-                    (raw_name.trim().to_string(), None)
+                    (raw_name, None)
                 }
             } else {
-                (raw_name.trim().to_string(), None)
+                (raw_name, None)
             };
+
+            // Names containing '/' can only come from malformed output (e.g. a file name with a newline)
+            if name.contains('/') {
+                continue;
+            }
 
             let clean_name = name.trim_start_matches('/');
             let clean_query = query_path.trim_start_matches('/');
@@ -1180,9 +1176,11 @@ pub fn parse_ls_output(output: &str, query_path: &str) -> Vec<RemoteFileItem> {
                 permissions: perms.to_string(),
             });
         } else {
-            // Robust fallback parser if ls output format slightly differs
+            // Fallback parser if ls output format slightly differs (e.g. device nodes "1, 3").
+            // Only accepted for lines that start with a permissions column, so continuation lines of
+            // file names containing a newline can't turn into fake entries.
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 6 {
+            if parts.len() >= 6 && PERMS_RE.is_match(parts[0]) {
                 let first = parts[0];
                 let is_symlink = first.starts_with('l');
                 let name_candidate = if parts.len() >= 8 && parts[parts.len() - 2].contains(':') {
@@ -1280,142 +1278,104 @@ pub async fn create_device_folder(serial: String, remote_path: String) -> Result
     Ok(res)
 }
 
-#[tauri::command]
-pub async fn delete_device_item(serial: String, remote_path: String) -> Result<String, String> {
-    let path = remote_path.trim();
-    let norm = path.trim_end_matches('/');
-    if norm.is_empty()
-        || norm == "/"
-        || norm == "/sdcard"
-        || norm == "/storage"
-        || norm == "/storage/emulated"
-        || norm == "/storage/emulated/0"
-        || norm == "/system"
-        || norm == "/data"
-    {
-        return Err("Нельзя удалить корневую директорию или хранилище".to_string());
+/// Lexically normalizes an absolute device path: collapses duplicate slashes, drops the trailing slash
+/// and rejects "." / ".." components (they could make a harmless-looking path resolve to a storage root).
+pub fn normalize_device_path(path: &str) -> Result<String, String> {
+    if !path.starts_with('/') {
+        return Err("Путь на устройстве должен быть абсолютным".to_string());
     }
-    let quoted = quote_posix_path(norm);
-    let res = execute_adb_command_async(&["-s", &serial, "shell", "rm", "-rf", &quoted], 5).await?;
-    invalidate_device_files_cache(&serial, Some(norm));
-    Ok(res)
+    let mut parts = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" => continue,
+            "." | ".." => return Err("Путь не должен содержать «.» или «..»".to_string()),
+            c => parts.push(c),
+        }
+    }
+    Ok(format!("/{}", parts.join("/")))
 }
 
-// Push local files/folders to device directory
+/// Paths whose removal would wipe user storage or break the OS. Expects a normalized absolute path.
+/// Comparison is case-insensitive because the emulated storage (/sdcard) is case-insensitive.
+pub fn is_protected_device_path(path: &str) -> bool {
+    static PROTECTED_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(concat!(
+            r"^(",
+            r"/storage/[^/]+",                       // /storage/emulated, /storage/self, SD cards (/storage/1234-ABCD)
+            r"|/storage/emulated/\d+(/android)?",    // user storage roots and their Android/ folder
+            r"|/storage/[^/]+/android",              // Android/ folder on SD cards
+            r"|/data/[^/]+",                         // /data/data, /data/app, /data/media, /data/local, ...
+            r"|/data/(media|user|user_de|misc_ce|misc_de|system_ce|system_de)/\d+",
+            r"|/data/local/tmp",
+            r"|/mnt(/[^/]+){1,4}",                   // mount points down to /mnt/user/0/emulated/0
+            r"|/(system|system_ext|vendor|product|odm|apex|proc|sys|dev|cache|config|metadata|linkerconfig)(/.*)?",
+            r")$"
+        ))
+        .unwrap()
+    });
+    const PROTECTED: &[&str] = &["/sdcard", "/storage/self/primary", "/storage/emulated/0", "/data/media/0"];
+
+    let p = path.trim_end_matches('/').to_lowercase();
+    // Root and every top-level directory (/sdcard, /storage, /data, /mnt, ...)
+    if p.matches('/').count() <= 1 {
+        return true;
+    }
+    if PROTECTED_RE.is_match(&p) {
+        return true;
+    }
+    // Ancestors of protected locations
+    PROTECTED.iter().any(|prot| *prot == p || prot.starts_with(&format!("{}/", p)))
+}
+
+const NOT_FOUND_MARKER: &str = "__TRANSFILE_NOT_FOUND__";
+
 #[tauri::command]
-pub async fn push_files_to_device(
-    app: AppHandle,
-    serial: String,
-    local_paths: Vec<String>,
-    remote_dir: String,
-) -> Result<bool, String> {
-    let adb_path = find_adb_path()?;
-    let _total_files = local_paths.len();
+pub async fn delete_device_item(serial: String, remote_path: String) -> Result<String, String> {
+    const PROTECTED_MSG: &str = "Нельзя удалить корневую директорию, хранилище или системную папку";
 
-    for (index, local_str) in local_paths.iter().enumerate() {
-        let local_path = PathBuf::from(local_str);
-        if !local_path.exists() {
-            continue;
-        }
+    let norm = normalize_device_path(remote_path.trim())?;
+    if is_protected_device_path(&norm) {
+        return Err(PROTECTED_MSG.to_string());
+    }
 
-        let file_name = local_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-
-        let file_size = if local_path.is_file() {
-            std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0)
-        } else {
-            calculate_dir_size(&local_path)
-        };
-
-        let transfer_id = format!("push-{}-{}", index, std::time::SystemTime::now().elapsed().map(|d| d.as_millis()).unwrap_or(0));
-
-        let _ = app.emit(
-            "transfer-progress",
-            TransferProgress {
-                transfer_id: transfer_id.clone(),
-                file_name: file_name.clone(),
-                current_bytes: 0,
-                total_bytes: file_size,
-                percentage: 0.0,
-                speed_mb_s: 0.0,
-                status: "starting".to_string(),
-                error_message: None,
-            },
-        );
-
-        let start_time = std::time::Instant::now();
-
-        // Run adb push
-        let mut cmd = tokio::process::Command::new(&adb_path);
-        cmd.args(&["-s", &serial, "push", local_str, &remote_dir]);
-
-        #[cfg(target_os = "windows")]
-        {
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-
-        let child = cmd.output().await;
-
-        match child {
-            Ok(output) => {
-                let elapsed = start_time.elapsed().as_secs_f32().max(0.001);
-                let speed_mb_s = (file_size as f32 / (1024.0 * 1024.0)) / elapsed;
-
-                if output.status.success() {
-                    let _ = app.emit(
-                        "transfer-progress",
-                        TransferProgress {
-                            transfer_id: transfer_id.clone(),
-                            file_name: file_name.clone(),
-                            current_bytes: file_size,
-                            total_bytes: file_size,
-                            percentage: 100.0,
-                            speed_mb_s,
-                            status: "completed".to_string(),
-                            error_message: None,
-                        },
-                    );
-                } else {
-                    let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-                    let _ = app.emit(
-                        "transfer-progress",
-                        TransferProgress {
-                            transfer_id: transfer_id.clone(),
-                            file_name: file_name.clone(),
-                            current_bytes: 0,
-                            total_bytes: file_size,
-                            percentage: 0.0,
-                            speed_mb_s: 0.0,
-                            status: "error".to_string(),
-                            error_message: Some(err_msg.clone()),
-                        },
-                    );
-                    return Err(format!("Ошибка передачи {}: {}", file_name, err_msg));
-                }
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "transfer-progress",
-                    TransferProgress {
-                        transfer_id: transfer_id.clone(),
-                        file_name: file_name.clone(),
-                        current_bytes: 0,
-                        total_bytes: file_size,
-                        percentage: 0.0,
-                        speed_mb_s: 0.0,
-                        status: "error".to_string(),
-                        error_message: Some(e.to_string()),
-                    },
-                );
-                return Err(format!("Не удалось запустить передачу: {}", e));
-            }
+    // Resolve symlinks on the device and re-check: both the full path and the location rm will actually
+    // act on (resolved parent + name, since rm removes a symlink itself, not its target).
+    let (parent, name) = norm.rsplit_once('/').unwrap_or(("", &norm));
+    let parent = if parent.is_empty() { "/" } else { parent };
+    let q_path = quote_posix_path(&norm);
+    let q_parent = quote_posix_path(parent);
+    let script = format!(
+        "if [ -e {p} ] || [ -L {p} ]; then readlink -f {p}; readlink -f {d}; else echo {nf}; fi",
+        p = q_path,
+        d = q_parent,
+        nf = NOT_FOUND_MARKER
+    );
+    let resolved = execute_adb_command_async(&["-s", &serial, "shell", &script], 5).await?;
+    if resolved.contains(NOT_FOUND_MARKER) {
+        return Err("Файл или папка не найдены на устройстве (список устарел?)".to_string());
+    }
+    let mut lines = resolved.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty());
+    let real_path = lines.next().unwrap_or("");
+    let real_parent = lines.next().unwrap_or("");
+    // Old devices without readlink print nothing useful here; then only the lexical check above applies
+    let mut candidates = Vec::new();
+    if real_path.starts_with('/') {
+        candidates.push(real_path.to_string());
+    }
+    if real_parent.starts_with('/') {
+        candidates.push(format!("{}/{}", real_parent.trim_end_matches('/'), name));
+    }
+    for candidate in candidates {
+        match normalize_device_path(&candidate) {
+            Ok(c) if !is_protected_device_path(&c) => {}
+            _ => return Err(PROTECTED_MSG.to_string()),
         }
     }
 
-    invalidate_device_files_cache(&serial, Some(&remote_dir));
-    Ok(true)
+    // Large folders can take a while; 5s used to report a false error while deletion continued
+    let res = execute_adb_command_async(&["-s", &serial, "shell", "rm", "-rf", &q_path], 300).await?;
+    invalidate_device_files_cache(&serial, Some(&norm));
+    Ok(res)
 }
 
 // Pull remote file from device to local directory
@@ -1427,12 +1387,20 @@ pub async fn pull_file_from_device(
     local_dir: String,
 ) -> Result<bool, String> {
     let adb_path = find_adb_path()?;
-    let file_name = Path::new(&remote_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "downloaded_file".to_string());
+    // Absolute paths only: a value starting with "-" would otherwise be parsed by adb as an option
+    let remote_path = normalize_device_path(remote_path.trim())?;
+    if !Path::new(&local_dir).is_absolute() || !Path::new(&local_dir).is_dir() {
+        return Err("Папка для сохранения не найдена".to_string());
+    }
+    // Device names are POSIX: split on '/' only ('\' is a valid character in Android file names)
+    let file_name = remote_path
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("downloaded_file")
+        .to_string();
 
-    let transfer_id = format!("pull-{}", std::time::SystemTime::now().elapsed().map(|d| d.as_millis()).unwrap_or(0));
+    let transfer_id = new_transfer_id("pull");
 
     let _ = app.emit(
         "transfer-progress",
@@ -1448,10 +1416,11 @@ pub async fn pull_file_from_device(
         },
     );
 
-    let _start_time = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
 
     let mut cmd = tokio::process::Command::new(&adb_path);
     cmd.args(&["-s", &serial, "pull", &remote_path, &local_dir]);
+    cmd.kill_on_drop(true);
 
     #[cfg(target_os = "windows")]
     {
@@ -1463,7 +1432,7 @@ pub async fn pull_file_from_device(
     if output.status.success() {
         let local_dest = Path::new(&local_dir).join(&file_name);
         let pulled_size = std::fs::metadata(&local_dest).map(|m| m.len()).unwrap_or(0);
-        let elapsed = _start_time.elapsed().as_secs_f32().max(0.001);
+        let elapsed = start_time.elapsed().as_secs_f32().max(0.001);
         let speed_mb_s = (pulled_size as f32 / (1024.0 * 1024.0)) / elapsed;
 
         let _ = app.emit(
@@ -1499,19 +1468,46 @@ pub async fn pull_file_from_device(
     }
 }
 
-fn calculate_dir_size(path: &Path) -> u64 {
+static TRANSFER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Unique transfer id. (`SystemTime::now().elapsed()` is always ~0, so ids used to collide.)
+pub fn new_transfer_id(prefix: &str) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}-{}", prefix, millis, seq)
+}
+
+/// Total size of a file or directory tree. Iterative and does not follow symlinks/junctions,
+/// so link loops can't cause infinite recursion (stack overflow -> crash).
+fn calculate_path_size(path: &Path) -> u64 {
     let mut total = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() {
-                total += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            } else if p.is_dir() {
-                total += calculate_dir_size(&p);
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+        if meta.is_file() {
+            total += meta.len();
+        } else if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&p) {
+                stack.extend(entries.flatten().map(|e| e.path()));
             }
         }
     }
     total
+}
+
+/// Timeout for one `adb push`: generous enough for slow Wi-Fi (assumes at least ~512 KB/s per device,
+/// with 6 devices sharing the link), without the old 300s cap that killed multi-GB transfers.
+fn push_timeout_secs(size: u64) -> u64 {
+    60 + size / (512 * 1024)
+}
+
+struct LocalPushItem {
+    path: String,
+    name: String,
+    size: u64,
 }
 
 // Push local files/folders to multiple target devices in parallel
@@ -1530,7 +1526,36 @@ pub async fn push_files_to_multiple_devices(
     }
 
     let adb_path = find_adb_path()?;
-    let total_files = local_paths.len();
+    let remote_dir = normalize_device_path(remote_dir.trim())?;
+
+    // Resolve existing files and their sizes once (not per device), off the async runtime threads.
+    // Missing files are dropped up front so per-device progress can actually reach "completed".
+    let items: Vec<LocalPushItem> = tokio::task::spawn_blocking(move || {
+        local_paths
+            .into_iter()
+            .filter_map(|p| {
+                let path = PathBuf::from(&p);
+                // Absolute paths only: a value starting with "-" would be parsed by adb as an option
+                if !path.is_absolute() || !path.exists() {
+                    return None;
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".to_string());
+                let size = calculate_path_size(&path);
+                Some(LocalPushItem { path: p, name, size })
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if items.is_empty() {
+        return Err("Выбранные файлы не найдены на компьютере".to_string());
+    }
+    let items = std::sync::Arc::new(items);
+    let total_files = items.len();
 
     let mut set = tokio::task::JoinSet::new();
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
@@ -1538,7 +1563,7 @@ pub async fn push_files_to_multiple_devices(
     for target in targets {
         let app_handle = app.clone();
         let adb_bin = adb_path.clone();
-        let paths = local_paths.clone();
+        let paths = items.clone();
         let dest_dir = remote_dir.clone();
         let sem = semaphore.clone();
 
@@ -1699,22 +1724,10 @@ pub async fn push_files_to_multiple_devices(
             // 4. Push each file/folder
             let mut completed_files = 0;
 
-            for (idx, local_str) in paths.iter().enumerate() {
-                let local_path = PathBuf::from(local_str);
-                if !local_path.exists() {
-                    continue;
-                }
-
-                let file_name = local_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file".to_string());
-
-                let file_size = if local_path.is_file() {
-                    std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0)
-                } else {
-                    calculate_dir_size(&local_path)
-                };
+            for (idx, item) in paths.iter().enumerate() {
+                let local_str = &item.path;
+                let file_name = item.name.clone();
+                let file_size = item.size;
 
                 let progress_pct = (completed_files as f32 / total_files as f32) * 100.0;
                 let _ = app_handle.emit(
@@ -1743,8 +1756,7 @@ pub async fn push_files_to_multiple_devices(
                 }
                 cmd.kill_on_drop(true);
 
-                // Adaptive timeout: base 25s + 1s per 500KB
-                let timeout_secs = (25 + (file_size / (500 * 1024))).clamp(25, 300);
+                let timeout_secs = push_timeout_secs(file_size);
 
                 let push_result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
 
@@ -1882,15 +1894,16 @@ mod tests {
         assert!(p.exists(), "ADB binary must exist: {:?}", p);
     }
 
-    #[test]
-    fn test_check_adb_status() {
-        let status = check_adb_status();
+    #[tokio::test]
+    async fn test_check_adb_status() {
+        let status = check_adb_status().await;
         assert!(status.is_ok(), "check_adb_status should succeed: {:?}", status);
         let s = status.unwrap();
         assert!(s.contains("Android Debug Bridge"), "Status should contain ADB banner: {}", s);
     }
 
     #[tokio::test]
+    #[ignore = "needs a running adb server / network / device"]
     async fn test_get_connected_devices() {
         let devices = get_connected_devices().await;
         assert!(devices.is_ok(), "get_connected_devices should return Ok: {:?}", devices);
@@ -1919,9 +1932,95 @@ mod tests {
         assert!(delete_device_item("dummy".into(), "/system".into()).await.is_err());
         assert!(delete_device_item("dummy".into(), "/data".into()).await.is_err());
         assert!(delete_device_item("dummy".into(), "".into()).await.is_err());
+        // Bypasses of the old string blocklist
+        assert!(delete_device_item("dummy".into(), "/storage/emulated/0/../0".into()).await.is_err());
+        assert!(delete_device_item("dummy".into(), "/sdcard/Download/..".into()).await.is_err());
+        assert!(delete_device_item("dummy".into(), "/storage/self/primary".into()).await.is_err());
+        assert!(delete_device_item("dummy".into(), "/data/media/0".into()).await.is_err());
+        assert!(delete_device_item("dummy".into(), "/mnt/user/0/emulated/0".into()).await.is_err());
+        assert!(delete_device_item("dummy".into(), "//sdcard//".into()).await.is_err());
+        assert!(delete_device_item("dummy".into(), "sdcard".into()).await.is_err());
+    }
+
+    #[test]
+    fn test_normalize_device_path() {
+        assert_eq!(normalize_device_path("/sdcard//Download/").unwrap(), "/sdcard/Download");
+        assert_eq!(normalize_device_path("/").unwrap(), "/");
+        assert!(normalize_device_path("/sdcard/./x").is_err());
+        assert!(normalize_device_path("/sdcard/a/../b").is_err());
+        assert!(normalize_device_path("relative/path").is_err());
+        assert!(normalize_device_path("--sync").is_err());
+    }
+
+    #[test]
+    fn test_is_protected_device_path() {
+        for p in [
+            "/", "/sdcard", "/storage", "/storage/emulated", "/storage/emulated/0", "/storage/emulated/10",
+            "/storage/self", "/storage/self/primary", "/storage/1234-ABCD", "/storage/emulated/0/Android",
+            "/storage/emulated/0/ANDROID", "/data", "/data/data", "/data/media", "/data/media/0", "/data/user/0",
+            "/data/local/tmp", "/mnt/user/0/emulated/0", "/mnt/media_rw/1234-ABCD", "/system/app", "/vendor/lib",
+        ] {
+            assert!(is_protected_device_path(p), "{} must be protected", p);
+        }
+        for p in [
+            "/sdcard/Download", "/sdcard/Download/file.txt", "/storage/emulated/0/DCIM/Camera",
+            "/storage/emulated/0/Android/data/com.example", "/storage/1234-ABCD/Movies", "/data/local/tmp/test.apk",
+            "/mnt/user/0/emulated/0/Download",
+        ] {
+            assert!(!is_protected_device_path(p), "{} must be deletable", p);
+        }
+    }
+
+    #[test]
+    fn test_parse_ls_output_keeps_significant_whitespace() {
+        let out = "drwxrwx--x 2 u0 media_rw 4096 2026-03-01 12:00 Photos \r\n\
+                   drwxrwx--x 2 u0 media_rw 4096 2026-03-01 12:00 Photos\r\n\
+                   -rw-rw---- 1 u0 media_rw 10 2026-03-01 12:00  leading.txt\n";
+        let items = parse_ls_output(out, "/sdcard");
+        let paths: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"/sdcard/Photos "), "{:?}", paths);
+        assert!(paths.contains(&"/sdcard/Photos"), "{:?}", paths);
+        assert!(paths.contains(&"/sdcard/ leading.txt"), "{:?}", paths);
+    }
+
+    #[test]
+    fn test_parse_ls_output_ignores_name_continuation_lines() {
+        // A file name containing a newline must not produce a fake entry from its second line
+        let out = "-rw-rw---- 1 u0 media_rw 10 2026-03-01 12:00 evil\nfoo bar baz qux quux Download\n";
+        let items = parse_ls_output(out, "/sdcard");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "evil");
+    }
+
+    #[test]
+    fn test_new_transfer_id_is_unique() {
+        let a = new_transfer_id("pull");
+        let b = new_transfer_id("pull");
+        assert_ne!(a, b);
+        assert!(!a.starts_with("pull-0-"), "timestamp must not be zero: {}", a);
+    }
+
+    #[test]
+    fn test_push_timeout_has_no_low_cap() {
+        // 4 GB must get far more than the old 300s cap
+        assert!(push_timeout_secs(4 * 1024 * 1024 * 1024) > 3600);
+        assert_eq!(push_timeout_secs(0), 60);
+    }
+
+    #[test]
+    fn test_calculate_path_size() {
+        let dir = std::env::temp_dir().join(format!("transfile_size_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("sub").join("b.bin"), vec![0u8; 50]).unwrap();
+        assert_eq!(calculate_path_size(&dir), 150);
+        assert_eq!(calculate_path_size(&dir.join("a.bin")), 100);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
+    #[ignore = "needs a running adb server / network / device"]
     async fn test_list_device_files() {
         let devices = get_connected_devices().await.unwrap();
         if let Some(dev) = devices.first() {
@@ -2056,7 +2155,7 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
     }
 
     #[tokio::test]
-    async fn test_auto_connect_lan_devices_filters_loopback() {
+    async fn test_connect_lan_devices_filters_loopback() {
         let hosts = vec![
             "127.0.0.1:5555".to_string(),
             "localhost:5555".to_string(),
@@ -2064,8 +2163,8 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             "".to_string(),
             "0.0.0.0".to_string(),
         ];
-        let res = auto_connect_lan_devices(hosts).await;
-        assert!(res.is_ok(), "auto_connect_lan_devices should succeed");
+        let res = connect_lan_devices(hosts).await;
+        assert!(res.is_ok(), "connect_lan_devices should succeed");
         // All loopback/invalid entries must be filtered out
         assert_eq!(res.unwrap().len(), 0);
     }
@@ -2223,6 +2322,7 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
     }
 
     #[tokio::test]
+    #[ignore = "needs a running adb server / network / device"]
     async fn test_connect_device_tls_port_failure_returns_pairing_hint() {
         let res = connect_device("192.168.1.1:37851".to_string()).await;
         assert!(res.is_err());

@@ -213,28 +213,19 @@ pub async fn discover_network_devices() -> Result<Vec<DiscoveredHost>, String> {
     Ok(combined)
 }
 
-// Auto-connect discovered hosts helper
-#[allow(dead_code)]
-pub async fn auto_connect_discovered(hosts: &[DiscoveredHost]) -> Result<Vec<String>, String> {
-    let host_strings: Vec<String> = hosts
-        .iter()
-        .filter(|h| h.ip != "127.0.0.1" && h.ip != "localhost" && h.ip != "0.0.0.0")
-        .map(|h| format!("{}:{}", h.ip, h.port))
-        .collect();
-    crate::adb::auto_connect_lan_devices(host_strings).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "touches the local network"]
     async fn test_get_local_ip() {
         let ip = get_local_ip();
         println!("Local IP: {:?}", ip);
     }
 
     #[tokio::test]
+    #[ignore = "touches the local network"]
     async fn test_scan_subnet_port() {
         if let Some(ip) = get_local_ip() {
             let hosts = scan_subnet_port(ip, 5555).await;
@@ -246,12 +237,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "touches the local network"]
     async fn test_scan_mdns() {
         let hosts = scan_mdns_services(1).await;
         println!("mDNS scan found {} hosts", hosts.len());
     }
 
     #[tokio::test]
+    #[ignore = "touches the local network"]
     async fn test_discover_network_devices() {
         let res = discover_network_devices().await;
         assert!(res.is_ok(), "discover_network_devices should succeed");

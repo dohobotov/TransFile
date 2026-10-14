@@ -87,21 +87,14 @@ export function App() {
     }
   };
 
+  // Discovery only: hosts are listed but never connected automatically. Connecting to every host
+  // with an open :5555 would let a rogue "device" in the LAN abuse this PC's ADB key and receive files.
+  // Connection happens only on explicit user action ("Подключить все" or per-host buttons).
   const scanNetwork = async () => {
     setIsScanningNetwork(true);
     try {
       const results = await invoke<DiscoveredHost[]>('discover_network_devices');
       setNetworkHosts(results);
-      if (results && results.length > 0) {
-        const hosts = results.map((h) => `${h.ip}:${h.port}`);
-        try {
-          await invoke('auto_connect_lan_devices', { hosts });
-        } catch (e) {
-          console.warn('Auto-connect LAN devices fallback:', e);
-          await Promise.allSettled(hosts.map((host) => invoke('connect_device', { host })));
-        }
-        await loadDevices();
-      }
     } catch (e) {
       console.error('Failed to discover network devices:', e);
     } finally {

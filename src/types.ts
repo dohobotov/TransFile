@@ -12,7 +12,7 @@ export interface DiscoveredHost {
   ip: string;
   port: number;
   name: string;
-  discovery_type: 'mdns' | 'port_scan';
+  discovery_type: 'mdns' | 'port_scan' | 'pairing';
 }
 
 export interface RemoteFileItem {

@@ -210,14 +210,21 @@ export const NetworkView: React.FC<NetworkViewProps> = ({ onDeviceConnected }) =
                           <div className="text-[11px] font-mono text-[#7c879c] flex items-center gap-2">
                             <span>{targetStr}</span>
                             <span className="text-[10px] px-1.5 py-0.2 rounded bg-[#1c2233] text-[#8a94a6]">
-                              {host.discovery_type === 'mdns' ? 'mDNS' : 'Port 5555'}
+                              {host.discovery_type === 'mdns'
+                                ? 'mDNS'
+                                : host.discovery_type === 'pairing'
+                                ? 'Сопряжение'
+                                : 'Port 5555'}
                             </span>
                           </div>
                         </div>
                       </div>
 
                       <button
-                        onClick={() => handleConnect(targetStr)}
+                        onClick={() =>
+                          // A pairing endpoint can't be connected to; prefill the pairing form instead
+                          host.discovery_type === 'pairing' ? setPairHost(targetStr) : handleConnect(targetStr)
+                        }
                         disabled={isConnecting}
                         className="px-3 py-1.5 bg-[#1b2132] hover:bg-sky-500 hover:text-white text-[#cbd5e1] text-xs font-semibold rounded-lg transition flex items-center gap-1.5 border border-[#2b334a]"
                       >
@@ -226,6 +233,8 @@ export const NetworkView: React.FC<NetworkViewProps> = ({ onDeviceConnected }) =
                             <RefreshCw className="w-3 h-3 animate-spin" />
                             Подключение...
                           </>
+                        ) : host.discovery_type === 'pairing' ? (
+                          'К сопряжению'
                         ) : (
                           'Подключить'
                         )}
