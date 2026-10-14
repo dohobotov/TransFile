@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { DeviceInfo, DiscoveredHost, TransferProgress } from './types';
+import { DeviceInfo, DiscoveredHost, MultiTransferDeviceProgress, TransferProgress } from './types';
 import { Sidebar, TabType } from './components/Sidebar';
-import { TransferView } from './components/TransferView';
+import { TransferSession, TransferView } from './components/TransferView';
 import { ExplorerView } from './components/ExplorerView';
 import { NetworkView } from './components/NetworkView';
 import { SettingsView } from './components/SettingsView';
@@ -22,6 +22,41 @@ export function App() {
   const [networkHosts, setNetworkHosts] = useState<DiscoveredHost[]>([]);
   const [isScanningNetwork, setIsScanningNetwork] = useState<boolean>(false);
 
+  // Transfer tab state kept here so that switching to Explorer and back keeps the checked recipients, the
+  // per-device progress of a running mass transfer and the «sending» lock (TransferView unmounts on switch).
+  const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(() => new Set());
+  const [multiProgress, setMultiProgress] = useState<Record<string, MultiTransferDeviceProgress>>({});
+  const [isSending, setIsSending] = useState(false);
+  const transferSession: TransferSession = {
+    selectedTargetIds,
+    setSelectedTargetIds,
+    multiProgress,
+    setMultiProgress,
+    isSending,
+    setIsSending,
+  };
+
+  useEffect(() => {
+    let unlistenFn: (() => void) | undefined;
+    let disposed = false;
+    listen<MultiTransferDeviceProgress>('multi-transfer-progress', (event) => {
+      const p = event.payload;
+      setMultiProgress((prev) => ({ ...prev, [p.device_id]: p }));
+      if (p.status === 'completed') {
+        // Prefetched listings must not hide the new files when Explorer is opened right after a transfer
+        markAllDirectoriesStale();
+        setExplorerRefreshTrigger((c) => c + 1);
+      }
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenFn = unlisten;
+    });
+    return () => {
+      disposed = true;
+      if (unlistenFn) unlistenFn();
+    };
+  }, []);
+
   // Check ADB status and load devices
   const checkAdb = async () => {
     try {
@@ -33,13 +68,23 @@ export function App() {
   };
 
   const isRefreshingDevicesRef = useRef(false);
+  // A refresh requested while one is running must not be lost (the device list may have changed meanwhile)
+  const refreshAgainRef = useRef(false);
 
   const loadDevices = async () => {
-    if (isRefreshingDevicesRef.current) return;
+    if (isRefreshingDevicesRef.current) {
+      refreshAgainRef.current = true;
+      return;
+    }
     isRefreshingDevicesRef.current = true;
     setIsRefreshingDevices(true);
     try {
-      const list = await invoke<DeviceInfo[]>('get_connected_devices');
+      const fetchedAt = Date.now();
+      const list = (await invoke<DeviceInfo[]>('get_connected_devices')).map((d) => ({
+        ...d,
+        // Absolute start of the readiness check, so «waiting» timers don't restart on every refresh
+        readiness_since: d.readiness === 'checking' && d.readiness_ms != null ? fetchedAt - d.readiness_ms : null,
+      }));
       const seenSerials = new Set<string>();
       const deduped = list
         .filter((d) => {
@@ -85,8 +130,34 @@ export function App() {
     } finally {
       setIsRefreshingDevices(false);
       isRefreshingDevicesRef.current = false;
+      if (refreshAgainRef.current) {
+        refreshAgainRef.current = false;
+        loadDevicesRef.current();
+      }
     }
   };
+  const loadDevicesRef = useRef(loadDevices);
+  loadDevicesRef.current = loadDevices;
+
+  // The backend follows `adb track-devices` and readiness probes: refresh on every change, so a device that
+  // comes back from "offline" (or starts answering after a reconnect) is shown without manual refresh.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    listen('adb-devices-changed', () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => loadDevicesRef.current(), 300);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   // Discovery only: hosts are listed but never connected automatically. Connecting to every host
   // with an open :5555 would let a rogue "device" in the LAN abuse this PC's ADB key and receive files.
@@ -119,10 +190,13 @@ export function App() {
 
   const selectedSerial = selectedDevice?.serial;
   const selectedState = selectedDevice?.state;
+  const selectedReadiness = selectedDevice?.readiness;
   useEffect(() => {
-    if (!selectedSerial || selectedState !== 'device') return;
+    // A device that is connected but not answering yet (MuMu right after a reconnect) would only make the
+    // prefetch time out; it runs as soon as the readiness probe reports 'ready'.
+    if (!selectedSerial || selectedState !== 'device' || selectedReadiness === 'checking') return;
     prefetchDevice(selectedSerial, explorerPathRef.current);
-  }, [selectedSerial, selectedState]);
+  }, [selectedSerial, selectedState, selectedReadiness]);
 
   // Listen to file transfer progress from Rust
   useEffect(() => {
@@ -204,6 +278,7 @@ export function App() {
       <main className="flex-1 flex min-h-0 min-w-0 overflow-hidden bg-[#0d0f17]">
         {currentTab === 'transfer' && (
           <TransferView
+            transferSession={transferSession}
             deviceSerial={selectedDevice?.serial || null}
             connectedDevices={devices}
             onRefreshConnectedDevices={loadDevices}
@@ -226,6 +301,9 @@ export function App() {
         {currentTab === 'explorer' && (
           <ExplorerView
             deviceSerial={selectedDevice?.serial || null}
+            deviceState={selectedDevice?.state ?? null}
+            deviceReadiness={selectedDevice?.readiness ?? null}
+            deviceCheckingSince={selectedDevice?.readiness_since ?? null}
             currentPath={explorerCurrentPath}
             onPathChange={setExplorerCurrentPath}
             targetRemotePath={targetRemotePath}

@@ -8,6 +8,8 @@ import {
   TargetDevice,
   MultiTransferDeviceProgress,
   TransferProgress,
+  ConnectOutcome,
+  ConnectProgress,
   formatBytes,
 } from '../types';
 import {
@@ -42,7 +44,15 @@ import { PairingModal } from './PairingModal';
 
 type GroupState = 'all' | 'some' | 'none';
 
-type LanRowStatus = 'connected' | 'unauthorized' | 'offline' | 'disconnected' | 'needsPairing';
+type LanRowStatus =
+  | 'connected'
+  | 'busy'
+  | 'unresponsive'
+  | 'unauthorized'
+  | 'reconnecting'
+  | 'offline'
+  | 'disconnected'
+  | 'needsPairing';
 
 interface LanRow {
   hostId: string;
@@ -67,13 +77,38 @@ const LAN_STATUS_STYLES = {
 
 const LAN_ROW_VIEW: Record<LanRowStatus, { dot: string; text: string; textClass: string; tooltip: string }> = {
   connected: { dot: 'bg-emerald-400', text: 'Подключено', textClass: 'text-emerald-300', tooltip: 'Подключено по Wi-Fi' },
+  busy: {
+    dot: 'bg-sky-400 animate-pulse',
+    text: 'Ждём ответа',
+    textClass: 'text-sky-300',
+    tooltip:
+      'Подключено, но устройство ещё не отвечает. Эмуляторы MuMu после переподключения недоступны около 2 минут — отправка файлов дождётся их автоматически.',
+  },
+  unresponsive: {
+    dot: 'bg-rose-500',
+    text: 'Не отвечает',
+    textClass: 'text-rose-300',
+    tooltip: 'Подключено, но устройство не отвечает на команды ADB больше 5 минут',
+  },
   unauthorized: {
     dot: 'bg-amber-400 animate-pulse',
     text: 'Авторизация',
     textClass: 'text-amber-300',
     tooltip: 'Подтвердите отладку на экране устройства',
   },
-  offline: { dot: 'bg-rose-500', text: 'Офлайн', textClass: 'text-rose-300', tooltip: 'Устройство не отвечает' },
+  reconnecting: {
+    dot: 'bg-sky-400 animate-pulse',
+    text: 'Ждём устройство',
+    textClass: 'text-sky-300',
+    tooltip:
+      'Устройство пока не отвечает на подключение (например, MuMu занят после прошлого отключения). adb подключит его сам — нажимать «Подключить» повторно не нужно. Если это длится больше 5–10 минут, перезапустите эмулятор.',
+  },
+  offline: {
+    dot: 'bg-rose-500',
+    text: 'Офлайн',
+    textClass: 'text-rose-300',
+    tooltip: 'ADB-соединение не активно. Нажмите «Подключить», чтобы переподключить устройство.',
+  },
   disconnected: { dot: 'bg-[#475569]', text: 'Не подключено', textClass: 'text-[#7c879c]', tooltip: 'Не подключено' },
   needsPairing: {
     dot: 'bg-amber-400/60',
@@ -113,7 +148,18 @@ const GroupCheckbox: React.FC<{
   );
 };
 
+/** Transfer-tab state owned by App so it survives switching tabs (see App.tsx) */
+export interface TransferSession {
+  selectedTargetIds: Set<string>;
+  setSelectedTargetIds: React.Dispatch<React.SetStateAction<Set<string>>>;
+  multiProgress: Record<string, MultiTransferDeviceProgress>;
+  setMultiProgress: React.Dispatch<React.SetStateAction<Record<string, MultiTransferDeviceProgress>>>;
+  isSending: boolean;
+  setIsSending: React.Dispatch<React.SetStateAction<boolean>>;
+}
+
 interface TransferViewProps {
+  transferSession: TransferSession;
   deviceSerial: string | null;
   connectedDevices: DeviceInfo[];
   onRefreshConnectedDevices: () => void;
@@ -130,6 +176,7 @@ interface TransferViewProps {
 }
 
 export const TransferView: React.FC<TransferViewProps> = ({
+  transferSession,
   deviceSerial,
   connectedDevices,
   onRefreshConnectedDevices,
@@ -145,22 +192,12 @@ export const TransferView: React.FC<TransferViewProps> = ({
   onTransferTriggered,
 }) => {
   const [isDragOver, setIsDragOver] = useState(false);
-  const [isSending, setIsSending] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Set of selected target IDs (serial for connected, "ip:port" for unconnected network)
-  const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(() => {
-    const initial = new Set<string>();
-    if (deviceSerial) {
-      initial.add(deviceSerial);
-    } else if (connectedDevices.length > 0) {
-      initial.add(connectedDevices[0].serial);
-    }
-    return initial;
-  });
-
-  // Track progress for multi-device parallel transfers
-  const [multiProgress, setMultiProgress] = useState<Record<string, MultiTransferDeviceProgress>>({});
+  // Recipients selection (serial for connected, "ip:port" for unconnected network), multi-device progress and
+  // the «sending» flag live in App: they must survive switching tabs while a transfer is running.
+  const { selectedTargetIds, setSelectedTargetIds, multiProgress, setMultiProgress, isSending, setIsSending } =
+    transferSession;
   // Track hosts currently connecting
   const [connectingHosts, setConnectingHosts] = useState<Set<string>>(new Set());
   // Track serials currently being disconnected by the toolbar «Отключить» action
@@ -322,8 +359,16 @@ export const TransferView: React.FC<TransferViewProps> = ({
         const conn = findConnectedDeviceForHost(h);
         let status: LanRowStatus;
         if (conn) {
-          status =
-            conn.state === 'device' ? 'connected' : conn.state === 'unauthorized' ? 'unauthorized' : 'offline';
+          if (conn.state === 'device') {
+            // Connected transport that doesn't answer yet (MuMu after a reconnect); a regular phone answers
+            // the readiness check within milliseconds, so short checks keep showing «Подключено»
+            const busyForLong = conn.readiness === 'checking' && (conn.readiness_ms ?? 0) > 1500;
+            status = busyForLong ? 'busy' : conn.readiness === 'unresponsive' ? 'unresponsive' : 'connected';
+          } else if (conn.state === 'unauthorized') {
+            status = 'unauthorized';
+          } else {
+            status = conn.reconnecting ? 'reconnecting' : 'offline';
+          }
         } else {
           status = h.discovery_type === 'pairing' ? 'needsPairing' : 'disconnected';
         }
@@ -370,23 +415,48 @@ export const TransferView: React.FC<TransferViewProps> = ({
     });
 
     try {
-      const connected = await invoke<string[]>('connect_lan_devices', { hosts });
-      const okSet = new Set(connected);
-      const failed = hosts.filter((h) => !okSet.has(h));
-      const okCount = hosts.length - failed.length;
-      const pairingHint = failed.some((h) => !h.endsWith(':5555'))
-        ? ' Для Android 11+ может понадобиться сопряжение — кнопка с ключом.'
-        : '';
-      if (failed.length === 0) {
-        setLanStatus({ kind: 'success', text: `Подключено: ${okCount} из ${hosts.length}.` });
-      } else if (okCount > 0) {
-        setLanStatus({
-          kind: 'warning',
-          text: `Подключено: ${okCount} из ${hosts.length}. Не удалось: ${failed.join(', ')}.${pairingHint}`,
-        });
-      } else {
-        setLanStatus({ kind: 'error', text: `Не удалось подключить: ${failed.join(', ')}.${pairingHint}` });
+      const outcomes = await invoke<ConnectOutcome[]>('connect_lan_devices', { hosts });
+      const byState = (s: ConnectOutcome['state']) => outcomes.filter((o) => o.state === s).map((o) => o.host);
+      const connected = byState('connected');
+      const unauthorized = byState('unauthorized');
+      const pending = byState('pending');
+      const failed = byState('failed');
+      const total = outcomes.length;
+
+      const busy = outcomes.filter((o) => o.state === 'connected' && o.busy).map((o) => o.host);
+      const parts: string[] = [];
+      if (connected.length > 0 || pending.length + unauthorized.length === 0) {
+        parts.push(`Подключено: ${connected.length} из ${total}.`);
       }
+      if (busy.length > 0) {
+        parts.push(
+          `Ещё не отвечают: ${busy.length} — эмуляторы MuMu оживают примерно через 2 минуты после переподключения (статус «Ждём ответа»), отправка файлов их дождётся.`
+        );
+      }
+      if (unauthorized.length > 0) {
+        parts.push(`Ждут разрешения отладки на экране: ${unauthorized.join(', ')}.`);
+      }
+      if (pending.length > 0) {
+        // Busy devices (MuMu after a reconnect): the adb server keeps connecting them; pressing again
+        // would only drop that connection and make the device busy for another ~2 minutes
+        parts.push(
+          `Ещё подключаются (устройство занято): ${pending.join(', ')} — adb подключит их сам, повторно нажимать не нужно.`
+        );
+      }
+      if (failed.length > 0) {
+        const pairingHint = failed.some((h) => !h.endsWith(':5555'))
+          ? ' Для Android 11+ может понадобиться сопряжение — кнопка с ключом.'
+          : '';
+        const reasons = outcomes
+          .filter((o) => o.state === 'failed')
+          .map((o) => `${o.host} (${o.message})`)
+          .join(', ');
+        parts.push(`Не удалось: ${reasons}.${pairingHint}`);
+      }
+      setLanStatus({
+        kind: connected.length === total ? 'success' : connected.length + pending.length + unauthorized.length > 0 ? 'warning' : 'error',
+        text: parts.join(' '),
+      });
     } catch (err: any) {
       setLanStatus({ kind: 'error', text: `Ошибка подключения: ${err}` });
     } finally {
@@ -433,7 +503,10 @@ export const TransferView: React.FC<TransferViewProps> = ({
       }
 
       if (failedSerials.length === 0) {
-        setLanStatus({ kind: 'success', text: `Отключено: ${okSerials.length}.` });
+        setLanStatus({
+          kind: 'success',
+          text: `Отключено: ${okSerials.length}. Эмуляторы MuMu после повторного подключения около 2 минут не отвечают — это нормально.`,
+        });
       } else if (okSerials.length > 0) {
         setLanStatus({
           kind: 'warning',
@@ -484,9 +557,34 @@ export const TransferView: React.FC<TransferViewProps> = ({
   // Success messages hide themselves; warnings and errors stay until dismissed or the next action
   useEffect(() => {
     if (!lanStatus || lanStatus.kind !== 'success') return;
-    const timer = setTimeout(() => setLanStatus(null), 4000);
+    // Longer messages (with a hint) stay long enough to be read
+    const timer = setTimeout(() => setLanStatus(null), lanStatus.text.length > 60 ? 9000 : 4000);
     return () => clearTimeout(timer);
   }, [lanStatus]);
+
+  // Per-host phase of a running «Подключить»: 'waiting' = the device is busy and adb keeps connecting it
+  const [waitingHosts, setWaitingHosts] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    listen<ConnectProgress>('lan-connect-progress', (event) => {
+      const { host, phase } = event.payload;
+      setWaitingHosts((prev) => {
+        if (phase === 'waiting' ? prev.has(host) : !prev.has(host)) return prev;
+        const next = new Set(prev);
+        if (phase === 'waiting') next.add(host);
+        else next.delete(host);
+        return next;
+      });
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   // Automatically prune dead/disconnected device IDs from selection
   useEffect(() => {
@@ -504,36 +602,6 @@ export const TransferView: React.FC<TransferViewProps> = ({
       return valid;
     });
   }, [directPcDevices, lanHosts]);
-
-  // Listen to multi-transfer-progress events from Rust backend. Subscribed once: onTransferTriggered is a
-  // new function on every App render, and re-subscribing each time leaked listeners whose cleanup ran
-  // before listen() resolved (and could miss events in between).
-  const onTransferTriggeredRef = useRef(onTransferTriggered);
-  onTransferTriggeredRef.current = onTransferTriggered;
-  useEffect(() => {
-    let unlistenFn: (() => void) | undefined;
-    let disposed = false;
-
-    listen<MultiTransferDeviceProgress>('multi-transfer-progress', (event) => {
-      const p = event.payload;
-      setMultiProgress((prev) => ({
-        ...prev,
-        [p.device_id]: p,
-      }));
-
-      if (p.status === 'completed') {
-        onTransferTriggeredRef.current();
-      }
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else unlistenFn = unlisten;
-    });
-
-    return () => {
-      disposed = true;
-      if (unlistenFn) unlistenFn();
-    };
-  }, []);
 
   const presets = [
     { label: 'Загрузки', path: '/sdcard/Download', icon: Download },
@@ -1026,10 +1094,20 @@ export const TransferView: React.FC<TransferViewProps> = ({
                       </div>
 
                       {isConnecting ? (
-                        <span className="flex items-center gap-1.5 shrink-0 text-[10px]" title="Подключение…">
-                          <LoaderCircle className="w-3 h-3 animate-spin text-amber-400" />
-                          <span className="hidden @[19rem]:inline text-amber-300">Подключение…</span>
-                        </span>
+                        waitingHosts.has(hostId) ? (
+                          <span
+                            className="flex items-center gap-1.5 shrink-0 text-[10px]"
+                            title="Устройство занято (например, MuMu после прошлого отключения). adb подключит его сам, как только оно ответит."
+                          >
+                            <LoaderCircle className="w-3 h-3 animate-spin text-sky-400" />
+                            <span className="hidden @[19rem]:inline text-sky-300">Ждём устройство…</span>
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5 shrink-0 text-[10px]" title="Подключение…">
+                            <LoaderCircle className="w-3 h-3 animate-spin text-amber-400" />
+                            <span className="hidden @[19rem]:inline text-amber-300">Подключение…</span>
+                          </span>
+                        )
                       ) : isDisconnecting ? (
                         <span className="flex items-center gap-1.5 shrink-0 text-[10px]" title="Отключение…">
                           <LoaderCircle className="w-3 h-3 animate-spin text-[#94a3b8]" />

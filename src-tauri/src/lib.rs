@@ -1,4 +1,5 @@
 mod adb;
+mod connection;
 mod dialog;
 mod scanner;
 
@@ -8,6 +9,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             adb::load_custom_adb_path(app.handle());
+            connection::start_device_watcher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -25,6 +27,7 @@ pub fn run() {
             adb::delete_device_item,
             adb::push_files_to_multiple_devices,
             adb::pull_file_from_device,
+            connection::wait_device_ready,
             scanner::discover_network_devices,
             dialog::pick_local_files,
             dialog::pick_local_folder,

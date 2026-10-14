@@ -142,6 +142,37 @@ export function prefetchDirectories(serial: string, paths: string[], maxAgeMs = 
   return Promise.all(tasks).then(() => undefined);
 }
 
+/**
+ * True for errors meaning "the device did not answer in time" (adb timeout or a dropped/offline transport),
+ * as opposed to errors from the device itself such as "No such file or directory".
+ */
+export function isDeviceUnresponsiveError(e: unknown): boolean {
+  const text = String(e ?? '').toLowerCase();
+  return (
+    text.includes('таймаут') ||
+    text.includes('device offline') ||
+    (text.includes('device') && text.includes('not found'))
+  );
+}
+
+const readinessWaits = new Map<string, Promise<void>>();
+
+/**
+ * Waits (one shared request per device) until the device answers commands again — e.g. a MuMu emulator,
+ * which ignores everything for ~2 min after a reconnect. `recheck` re-probes a device that was considered
+ * ready but whose command just timed out.
+ */
+export function waitDeviceReady(serial: string, recheck = false): Promise<void> {
+  const pending = readinessWaits.get(serial);
+  if (pending) return pending;
+  const wait = invoke<void>('wait_device_ready', { serial, recheck }).finally(() => {
+    if (readinessWaits.get(serial) === wait) readinessWaits.delete(serial);
+  });
+  readinessWaits.set(serial, wait);
+  wait.catch(() => {});
+  return wait;
+}
+
 export function prefetchBookmarks(serial: string): Promise<void> {
   return prefetchDirectories(
     serial,

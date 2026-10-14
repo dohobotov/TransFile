@@ -6,6 +6,32 @@ export interface DeviceInfo {
   state: 'device' | 'unauthorized' | 'offline' | string;
   ip?: string;
   port?: number;
+  /**
+   * Whether the connected transport answers commands. A MuMu emulator stays 'checking' for ~2 min after a
+   * reconnect: the connection is up, but adbd processes nothing until it has released the old one.
+   */
+  readiness: 'ready' | 'checking' | 'unresponsive' | 'unknown' | string;
+  /** Milliseconds since the readiness check started (only while 'checking') */
+  readiness_ms?: number | null;
+  /** Frontend-computed: Date.now() timestamp when the readiness check started (only while 'checking') */
+  readiness_since?: number | null;
+  /** Offline network device the adb server is still re-connecting by itself (it comes back on its own) */
+  reconnecting?: boolean;
+}
+
+/** Result of `connect_lan_devices` / `connect_host` for one host */
+export interface ConnectOutcome {
+  host: string;
+  /** 'pending': the device is busy; the adb server keeps connecting it by itself */
+  state: 'connected' | 'unauthorized' | 'pending' | 'failed';
+  message: string;
+  /** Connected, but not answering commands yet (MuMu needs ~2 min after a reconnect) */
+  busy: boolean;
+}
+
+export interface ConnectProgress {
+  host: string;
+  phase: 'connecting' | 'waiting' | 'done';
 }
 
 export interface DiscoveredHost {

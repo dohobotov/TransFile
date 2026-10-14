@@ -18,6 +18,14 @@ pub struct DeviceInfo {
     pub state: String,       // "device" | "unauthorized" | "offline"
     pub ip: Option<String>,
     pub port: Option<u16>,
+    /// Whether the transport answers commands: "ready" | "checking" | "unresponsive" | "unknown".
+    /// A MuMu emulator stays "checking" for ~2 min after a reconnect (see connection.rs).
+    pub readiness: String,
+    /// Milliseconds since the readiness check started (only while "checking")
+    pub readiness_ms: Option<u64>,
+    /// Offline network device that the adb server is still re-connecting (it holds an open socket):
+    /// it comes back by itself; closing that socket would only delay a busy MuMu device further.
+    pub reconnecting: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,10 +326,8 @@ pub async fn set_custom_adb_path(app: AppHandle, path: String) -> Result<String,
     Ok(status)
 }
 
-pub fn get_local_listening_ports_with_pids() -> (HashSet<u16>, HashMap<u16, u32>) {
-    let mut ports = HashSet::new();
-    let mut port_to_pid = HashMap::new();
-
+/// Output of `netstat -ano -p tcp` (Windows only; None elsewhere or on failure).
+pub fn netstat_tcp_output() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -330,8 +336,18 @@ pub fn get_local_listening_ports_with_pids() -> (HashSet<u16>, HashMap<u16, u32>
         let mut cmd = Command::new(system_root.join("System32").join("NETSTAT.EXE"));
         cmd.args(&["-ano", "-p", "tcp"]);
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        if let Ok(output) = cmd.output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+        return cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    None
+}
+
+pub fn get_local_listening_ports_with_pids() -> (HashSet<u16>, HashMap<u16, u32>) {
+    let mut ports = HashSet::new();
+    let mut port_to_pid = HashMap::new();
+
+    {
+        if let Some(stdout) = netstat_tcp_output() {
             for line in stdout.lines() {
                 if line.contains("LISTENING") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -761,10 +777,10 @@ pub async fn get_connected_devices() -> Result<Vec<DeviceInfo>, String> {
                 }
                 Err(_) => continue,
             }
-        } else if offline.contains(':') {
-            // Remote Wi-Fi/LAN device: attempt reconnection so transient disconnects recover
-            "connect"
         } else {
+            // Remote Wi-Fi/LAN devices are left alone: `adb connect` on an offline transport is a no-op
+            // ("already connected"), and the adb server already re-connects them by itself. Closing that
+            // pending connection would keep a busy MuMu device offline ~129 s longer (see connection.rs).
             continue;
         };
         offline_set.spawn(async move {
@@ -781,6 +797,16 @@ pub async fn get_connected_devices() -> Result<Vec<DeviceInfo>, String> {
         execute_adb_command_async(&["devices", "-l"], 4).await.unwrap_or(output)
     } else {
         output
+    };
+
+    // Only needed (one more netstat, ~20 ms) when some network device is offline
+    let has_offline_network = effective_output
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == Some("offline") && l.contains(':'));
+    let netstat_for_offline = if has_offline_network {
+        tokio::task::spawn_blocking(netstat_tcp_output).await.ok().flatten()
+    } else {
+        None
     };
 
     let mut raw_devices = Vec::new();
@@ -841,6 +867,16 @@ pub async fn get_connected_devices() -> Result<Vec<DeviceInfo>, String> {
             "usb".to_string()
         };
 
+        let (readiness, readiness_ms) = if state == "device" {
+            crate::connection::readiness_of(&serial)
+        } else {
+            ("unknown".to_string(), None)
+        };
+        let reconnecting = state == "offline"
+            && netstat_for_offline
+                .as_deref()
+                .is_some_and(|n| crate::connection::server_socket_to_host(n, &serial));
+
         raw_devices.push(DeviceInfo {
             serial,
             model,
@@ -849,6 +885,9 @@ pub async fn get_connected_devices() -> Result<Vec<DeviceInfo>, String> {
             state,
             ip,
             port,
+            readiness,
+            readiness_ms,
+            reconnecting,
         });
     }
 
@@ -910,168 +949,75 @@ pub async fn get_connected_devices() -> Result<Vec<DeviceInfo>, String> {
     Ok(devices)
 }
 
+/// Hosts for `connect_lan_devices`: normalized ("ip" -> "ip:5555"), without loopback and duplicates, in
+/// the caller's order.
+pub fn lan_connect_candidates(hosts: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    hosts
+        .iter()
+        .filter(|h| !h.trim().is_empty())
+        .map(|h| normalize_host(h))
+        .filter(|h| {
+            !(h.starts_with("127.0.0.1") || h.starts_with("localhost") || h.starts_with("::1") || h.starts_with("0.0.0.0"))
+        })
+        .filter(|h| seen.insert(h.clone()))
+        .collect()
+}
+
+/// "ip" -> "ip:5555"; anything with a port is kept as is.
+pub fn normalize_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.contains(':') {
+        trimmed.to_string()
+    } else {
+        format!("{}:5555", trimmed)
+    }
+}
+
 #[tauri::command]
-pub async fn connect_device(host: String) -> Result<String, String> {
-    let host = host.trim();
-    if host.is_empty() {
+pub async fn connect_device(app: AppHandle, host: String) -> Result<String, String> {
+    if host.trim().is_empty() {
         return Err("Адрес хоста не может быть пустым".to_string());
     }
+    let host = normalize_host(&host);
     let is_loopback = host.starts_with("127.0.0.1") || host.starts_with("localhost");
-    let port = host.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(5555);
+    let port = host.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(5555);
     let pairing_hint = "Устройство требует первичного сопряжения по коду безопасности (Android 11+ Беспроводная отладка). Нажмите «Сопряжение» и введите 6-значный код.";
 
-    let res = match execute_adb_command_async(&["connect", host], 8).await {
-        Ok(out) => out,
-        Err(err) => {
-            if !is_loopback && port != 5555 {
-                let err_lower = err.to_lowercase();
-                if err_lower.contains("failed")
-                    || err_lower.contains("unable")
-                    || err_lower.contains("cannot")
-                    || err_lower.contains("refused")
-                {
-                    return Err(pairing_hint.to_string());
-                }
-            }
-            return Err(err);
-        }
-    };
-
-    let res_lower = res.to_lowercase();
-    let is_connected = (res_lower.contains("connected") || res_lower.contains("already connected"))
-        && !res_lower.contains("cannot connect")
-        && !res_lower.contains("unable to connect")
-        && !res_lower.contains("failed to connect");
-
-    if !is_connected {
-        if !is_loopback && port != 5555 {
-            return Err(pairing_hint.to_string());
-        }
-        return Err(res.trim().to_string());
+    let result = crate::connection::connect_host(Some(&app), &host).await;
+    match result.state.as_str() {
+        "connected" => Ok(format!("Подключено к {}", host)),
+        "unauthorized" => Ok(format!("Подключено к {}, но устройство ожидает авторизации! Нажмите «Разрешить отладку» на экране телефона.", host)),
+        "pending" => Ok(format!("{}: {}", host, result.message)),
+        _ if !is_loopback && port != 5555 => Err(pairing_hint.to_string()),
+        _ => Err(result.message),
     }
-
-    // Check device state
-    if let Ok(state) = execute_adb_command_async(&["-s", host, "get-state"], 3).await {
-        let state = state.trim();
-        if state.contains("unauthorized") {
-            return Ok(format!("Подключено к {}, но устройство ожидает авторизации! Нажмите «Разрешить отладку» на экране телефона.", host));
-        }
-    }
-
-    Ok(res.trim().to_string())
 }
 
 /// Connects to the given LAN hosts in parallel. Invoked only by an explicit user action
 /// (the «Подключить» button for checked LAN devices); returns the hosts that are connected afterwards (including already connected ones).
 #[tauri::command]
-pub async fn connect_lan_devices(hosts: Vec<String>) -> Result<Vec<String>, String> {
-    if hosts.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 1. Fetch currently connected device serials to avoid re-connecting existing devices
-    let connected_serials: HashSet<String> = match execute_adb_command_async(&["devices"], 2).await {
-        Ok(out) => out
-            .lines()
-            .skip(1)
-            .filter_map(|l| {
-                let parts: Vec<&str> = l.split_whitespace().collect();
-                if parts.len() >= 2 && (parts[1] == "device" || parts[1] == "unauthorized") {
-                    Some(parts[0].to_string())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        Err(_) => HashSet::new(),
-    };
-
-    // 2. Filter and normalize candidate hosts
-    let mut candidate_hosts = Vec::new();
-    let mut already_connected = Vec::new();
-    let mut seen = HashSet::new();
-
-    for raw_host in hosts {
-        let trimmed = raw_host.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Normalize: append port 5555 if only IP was given
-        let host = if trimmed.contains(':') {
-            trimmed.to_string()
-        } else {
-            format!("{}:5555", trimmed)
-        };
-
-        // Filter out local loopback (127.0.0.1, localhost, ::1, 0.0.0.0)
-        let is_loopback = host.starts_with("127.0.0.1")
-            || host.starts_with("localhost")
-            || host.starts_with("::1")
-            || host.starts_with("0.0.0.0");
-        if is_loopback {
-            continue;
-        }
-
-        if !seen.insert(host.clone()) {
-            continue;
-        }
-
-        // Hosts already connected need no new connection attempt
-        if connected_serials.contains(&host) {
-            already_connected.push(host);
-        } else {
-            candidate_hosts.push(host);
-        }
-    }
-
-    if candidate_hosts.is_empty() {
-        already_connected.sort();
-        return Ok(already_connected);
-    }
-
-    // 3. Connect candidate hosts concurrently with a concurrency limit of 8
+pub async fn connect_lan_devices(app: AppHandle, hosts: Vec<String>) -> Result<Vec<crate::connection::ConnectOutcome>, String> {
+    let candidates = lan_connect_candidates(&hosts);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let mut set = tokio::task::JoinSet::new();
-
-    for host in candidate_hosts {
+    for (idx, host) in candidates.into_iter().enumerate() {
         let sem = semaphore.clone();
+        let app = app.clone();
         set.spawn(async move {
-            let _permit = match sem.acquire().await {
-                Ok(p) => p,
-                Err(_) => return None,
-            };
-
-            // 3-second timeout per connection attempt
-            let res = execute_adb_command_async(&["connect", &host], 3).await;
-            match res {
-                Ok(out) => {
-                    let out_lower = out.to_lowercase();
-                    let is_connected = (out_lower.contains("connected") || out_lower.contains("already connected"))
-                        && !out_lower.contains("cannot connect")
-                        && !out_lower.contains("unable to connect")
-                        && !out_lower.contains("failed")
-                        && !out_lower.contains("refused");
-                    if is_connected {
-                        Some(host)
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
-            }
+            let _permit = sem.acquire().await;
+            (idx, crate::connection::connect_host(Some(&app), &host).await)
         });
     }
 
-    let mut successfully_connected = already_connected;
+    let mut results = Vec::new();
     while let Some(res) = set.join_next().await {
-        if let Ok(Some(host)) = res {
-            successfully_connected.push(host);
+        if let Ok(r) = res {
+            results.push(r);
         }
     }
-
-    successfully_connected.sort();
-    Ok(successfully_connected)
+    results.sort_by_key(|(idx, _)| *idx);
+    Ok(results.into_iter().map(|(_, outcome)| outcome).collect())
 }
 
 #[tauri::command]
@@ -1806,12 +1752,6 @@ pub async fn push_files_to_multiple_devices(
                 },
             );
 
-            // Limit parallel operations so ADB daemon and Wi-Fi are not overwhelmed
-            let _permit = match sem.acquire().await {
-                Ok(p) => p,
-                Err(_) => return Err("Ошибка очереди задач".to_string()),
-            };
-
             // 1. If not connected, connect first
             if !target.is_connected {
                 let _ = app_handle.emit(
@@ -1829,27 +1769,39 @@ pub async fn push_files_to_multiple_devices(
                     },
                 );
 
-                let conn_res = execute_adb_command_async(&["connect", &device_id], 8).await;
-                let conn_ok = match &conn_res {
-                    Ok(out) => {
-                        (out.contains("connected") || out.contains("already connected"))
-                            && !out.contains("cannot connect")
-                            && !out.contains("unable to connect")
-                            && !out.contains("failed")
+                let conn = crate::connection::connect_host(None, &device_id).await;
+                let conn_err = match conn.state.as_str() {
+                    "connected" => None,
+                    "pending" => {
+                        // Busy device (e.g. MuMu after a reconnect): the adb server keeps connecting it
+                        let _ = app_handle.emit(
+                            "multi-transfer-progress",
+                            MultiTransferDeviceProgress {
+                                device_id: device_id.clone(),
+                                device_name: device_name.clone(),
+                                current_file: "Ожидание ответа устройства…".to_string(),
+                                total_files,
+                                completed_files: 0,
+                                percentage: 0.0,
+                                speed_mb_s: 0.0,
+                                status: "connecting".to_string(),
+                                error_message: None,
+                            },
+                        );
+                        if crate::connection::wait_for_device_state(&device_id, crate::connection::READY_TIMEOUT).await {
+                            None
+                        } else {
+                            Some("Устройство не ответило на подключение (занято или недоступно).".to_string())
+                        }
                     }
-                    Err(_) => false,
+                    "unauthorized" => None, // reported by the state check below
+                    _ if conn.message.trim().is_empty() => {
+                        Some("Порт 5555 не отвечает. Проверьте отладку по Wi-Fi на устройстве.".to_string())
+                    }
+                    _ => Some(format!("Не удалось подключиться: {}", conn.message.trim())),
                 };
 
-                if !conn_ok {
-                    let raw_err = match conn_res {
-                        Ok(o) => o.trim().to_string(),
-                        Err(e) => e.trim().to_string(),
-                    };
-                    let err_msg = if raw_err.is_empty() {
-                        "Порт 5555 не отвечает. Проверьте отладку по Wi-Fi на устройстве.".to_string()
-                    } else {
-                        format!("Не удалось подключиться: {}", raw_err)
-                    };
+                if let Some(err_msg) = conn_err {
 
                     let _ = app_handle.emit(
                         "multi-transfer-progress",
@@ -1869,8 +1821,32 @@ pub async fn push_files_to_multiple_devices(
                 }
             }
 
-            // 2. Verify device state (check for unauthorized or offline state)
-            let state_res = execute_adb_command_async(&["-s", &device_id, "get-state"], 4).await;
+            // 2. Verify device state (check for unauthorized or offline state). An offline network device is
+            // usually one the adb server is still re-connecting (busy MuMu): wait for it instead of failing.
+            let mut state_res = execute_adb_command_async(&["-s", &device_id, "get-state"], 4).await;
+            let is_offline = match &state_res {
+                Ok(s) => s.trim() == "offline",
+                Err(e) => e.contains("offline"),
+            };
+            if is_offline && device_id.contains(':') {
+                let _ = app_handle.emit(
+                    "multi-transfer-progress",
+                    MultiTransferDeviceProgress {
+                        device_id: device_id.clone(),
+                        device_name: device_name.clone(),
+                        current_file: "Ожидание ответа устройства…".to_string(),
+                        total_files,
+                        completed_files: 0,
+                        percentage: 0.0,
+                        speed_mb_s: 0.0,
+                        status: "connecting".to_string(),
+                        error_message: None,
+                    },
+                );
+                if crate::connection::wait_for_device_state(&device_id, crate::connection::READY_TIMEOUT).await {
+                    state_res = Ok("device".to_string());
+                }
+            }
             match state_res {
                 Ok(ref state) if state.trim() == "device" => {
                     // Device is ready
@@ -1927,6 +1903,49 @@ pub async fn push_files_to_multiple_devices(
                     return Err(err_msg);
                 }
             }
+
+            // 2b. A freshly (re)connected MuMu device accepts the connection but answers nothing for ~2 min:
+            // wait for it instead of letting mkdir/push time out
+            if crate::connection::readiness_of(&device_id).0 != "ready" {
+                let _ = app_handle.emit(
+                    "multi-transfer-progress",
+                    MultiTransferDeviceProgress {
+                        device_id: device_id.clone(),
+                        device_name: device_name.clone(),
+                        current_file: "Ожидание ответа устройства…".to_string(),
+                        total_files,
+                        completed_files: 0,
+                        percentage: 0.0,
+                        speed_mb_s: 0.0,
+                        status: "connecting".to_string(),
+                        error_message: None,
+                    },
+                );
+                if let Err(e) = crate::connection::ensure_ready(&app_handle, &device_id, crate::connection::READY_TIMEOUT).await {
+                    let _ = app_handle.emit(
+                        "multi-transfer-progress",
+                        MultiTransferDeviceProgress {
+                            device_id: device_id.clone(),
+                            device_name: device_name.clone(),
+                            current_file: "".to_string(),
+                            total_files,
+                            completed_files: 0,
+                            percentage: 0.0,
+                            speed_mb_s: 0.0,
+                            status: "error".to_string(),
+                            error_message: Some(e.clone()),
+                        },
+                    );
+                    return Err(e);
+                }
+            }
+
+            // Limit parallel transfers so the ADB server and Wi-Fi are not overwhelmed. Taken only now:
+            // connecting / waiting for a busy device must not hold a slot other devices could push with.
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return Err("Ошибка очереди задач".to_string()),
+            };
 
             // 3. Ensure remote directory exists
             let quoted_dir = quote_posix_path(&dest_dir);
@@ -2499,8 +2518,8 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
         assert!(!is_directory_item("lrwxrwxrwx", "prop", Some("/system/etc/build.prop")));
     }
 
-    #[tokio::test]
-    async fn test_connect_lan_devices_filters_loopback() {
+    #[test]
+    fn test_lan_connect_candidates() {
         let hosts = vec![
             "127.0.0.1:5555".to_string(),
             "localhost:5555".to_string(),
@@ -2508,10 +2527,19 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             "".to_string(),
             "0.0.0.0".to_string(),
         ];
-        let res = connect_lan_devices(hosts).await;
-        assert!(res.is_ok(), "connect_lan_devices should succeed");
         // All loopback/invalid entries must be filtered out
-        assert_eq!(res.unwrap().len(), 0);
+        assert!(lan_connect_candidates(&hosts).is_empty());
+
+        let hosts = vec![
+            "192.168.1.20".to_string(),
+            " 192.168.1.30:5555 ".to_string(),
+            "192.168.1.20:5555".to_string(),
+            "192.168.1.40:37145".to_string(),
+        ];
+        assert_eq!(
+            lan_connect_candidates(&hosts),
+            vec!["192.168.1.20:5555", "192.168.1.30:5555", "192.168.1.40:37145"]
+        );
     }
 
     #[test]
@@ -2530,6 +2558,9 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             state: "device".to_string(),
             ip: Some("127.0.0.1".to_string()),
             port: Some(16480),
+            readiness: "unknown".into(),
+            readiness_ms: None,
+            reconnecting: false,
         };
         let dev_mumu_secondary = DeviceInfo {
             serial: "127.0.0.1:5561".to_string(),
@@ -2539,6 +2570,9 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             state: "device".to_string(),
             ip: Some("127.0.0.1".to_string()),
             port: Some(5561),
+            readiness: "unknown".into(),
+            readiness_ms: None,
+            reconnecting: false,
         };
         let dev_native = DeviceInfo {
             serial: "emulator-5554".to_string(),
@@ -2548,6 +2582,9 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             state: "device".to_string(),
             ip: None,
             port: None,
+            readiness: "unknown".into(),
+            readiness_ms: None,
+            reconnecting: false,
         };
 
         assert_eq!(resolve_emulator_pid(&dev_mumu_primary, &port_to_pid), Some(32568));
@@ -2592,6 +2629,9 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             state: "device".to_string(),
             ip: Some("127.0.0.1".to_string()),
             port: Some(port),
+            readiness: "unknown".into(),
+            readiness_ms: None,
+            reconnecting: false,
         };
 
         // All 13 connected ports passed into deduplicator
@@ -2644,6 +2684,9 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             state: "device".to_string(),
             ip: None,
             port: None,
+            readiness: "unknown".into(),
+            readiness_ms: None,
+            reconnecting: false,
         };
         let dev_tcp = DeviceInfo {
             serial: "127.0.0.1:5555".to_string(),
@@ -2653,6 +2696,9 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
             state: "device".to_string(),
             ip: Some("127.0.0.1".to_string()),
             port: Some(5555),
+            readiness: "unknown".into(),
+            readiness_ms: None,
+            reconnecting: false,
         };
 
         let (kept, mirrors) = deduplicate_emulator_devices(
@@ -2664,18 +2710,5 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].serial, "emulator-5554");
         assert_eq!(mirrors, vec!["127.0.0.1:5555".to_string()]);
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a running adb server / network / device"]
-    async fn test_connect_device_tls_port_failure_returns_pairing_hint() {
-        let res = connect_device("192.168.1.1:37851".to_string()).await;
-        assert!(res.is_err());
-        let err = res.unwrap_err();
-        assert!(
-            err.contains("Устройство требует первичного сопряжения"),
-            "Error should contain pairing hint, got: {}",
-            err
-        );
     }
 }

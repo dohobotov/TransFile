@@ -6,8 +6,10 @@ import {
   fetchDirectory,
   getCachedDirectory,
   invalidateDirectory,
+  isDeviceUnresponsiveError,
   isFresh,
   prefetchBookmarks,
+  waitDeviceReady,
 } from '../explorerCache';
 import {
   Folder,
@@ -27,10 +29,28 @@ import {
   HardDrive,
   Check,
   SendHorizontal,
+  LoaderCircle,
+  WifiOff,
+  ShieldAlert,
+  AlertCircle,
 } from 'lucide-react';
+
+/** Why the device can't be listed right now (null: it can) */
+type DeviceWait = 'offline' | 'unauthorized' | 'busy' | 'unresponsive' | null;
+
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
 
 interface ExplorerViewProps {
   deviceSerial: string | null;
+  /** adb state of the device: 'device' | 'offline' | 'unauthorized' | ... */
+  deviceState?: string | null;
+  /** 'ready' | 'checking' | 'unresponsive' | 'unknown' (see DeviceInfo.readiness) */
+  deviceReadiness?: string | null;
+  /** Date.now() timestamp when the readiness check started (while 'checking') */
+  deviceCheckingSince?: number | null;
   currentPath: string;
   onPathChange: (newPath: string) => void;
   targetRemotePath: string;
@@ -41,6 +61,9 @@ interface ExplorerViewProps {
 
 export const ExplorerView: React.FC<ExplorerViewProps> = ({
   deviceSerial,
+  deviceState = null,
+  deviceReadiness = null,
+  deviceCheckingSince = null,
   currentPath,
   onPathChange,
   targetRemotePath,
@@ -67,6 +90,46 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   const [newFolderName, setNewFolderName] = useState('');
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // A listing timed out although the device looked ready: re-checking readiness until it answers
+  const [timedOut, setTimedOut] = useState(false);
+  const lastReadyRef = useRef<{ serial: string; at: number } | null>(null);
+
+  const deviceWait: DeviceWait = !deviceSerial
+    ? null
+    : deviceState && deviceState !== 'device'
+    ? deviceState === 'unauthorized'
+      ? 'unauthorized'
+      : 'offline'
+    : deviceReadiness === 'checking' || timedOut
+    ? 'busy'
+    : deviceReadiness === 'unresponsive'
+    ? 'unresponsive'
+    : null;
+
+  // Elapsed-time display while waiting for a busy device: counted from the start of the backend readiness
+  // check when known, otherwise from when this view started waiting (listing timeout)
+  const [localBusySince, setLocalBusySince] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (deviceWait !== 'busy') {
+      setLocalBusySince(null);
+      return;
+    }
+    setLocalBusySince((prev) => prev ?? Date.now());
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [deviceWait]);
+  const busySince =
+    deviceWait !== 'busy'
+      ? null
+      : deviceReadiness === 'checking' && deviceCheckingSince
+      ? Math.min(deviceCheckingSince, localBusySince ?? deviceCheckingSince)
+      : localBusySince;
+
+  useEffect(() => {
+    setTimedOut(false);
+  }, [deviceSerial]);
 
   // References to prevent race conditions during rapid folder navigation
   const activePathRef = useRef(currentPath);
@@ -82,6 +145,23 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   }, [currentPath, deviceSerial]);
 
   const presets = BOOKMARK_PRESETS;
+
+  // Re-probes the device and keeps the «waiting» panel up until it answers; the main effect then reloads
+  // the listing (deviceWait goes back to null). One shared probe per device, see waitDeviceReady.
+  const waitForDevice = (serial: string) => {
+    setErrorMsg(null);
+    setTimedOut(true);
+    waitDeviceReady(serial, true)
+      .then(() => {
+        lastReadyRef.current = { serial, at: Date.now() };
+        if (activeSerialRef.current === serial) setTimedOut(false);
+      })
+      .catch((err) => {
+        if (activeSerialRef.current !== serial) return;
+        setTimedOut(false);
+        setErrorMsg(`Устройство не отвечает: ${err}`);
+      });
+  };
 
   // SWR: Instantly show cached directory contents, revalidate in background without blocking spinners
   const loadDirectory = async (path: string, forceRefresh = false) => {
@@ -132,7 +212,14 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
       }
     } catch (e: any) {
       if (isCurrent()) {
-        if (!cached) {
+        const justConfirmedReady =
+          lastReadyRef.current?.serial === deviceSerial && Date.now() - lastReadyRef.current.at < 15_000;
+        if (isDeviceUnresponsiveError(e) && !justConfirmedReady) {
+          // The device stopped answering (e.g. MuMu right after a reconnect): wait for it instead of failing
+          waitForDevice(deviceSerial);
+        } else if (!cached) {
+          // (A timeout right after the device proved it answers is a slow listing, not a busy device:
+          // report it instead of waiting in a loop.)
           setErrorMsg(`Ошибка загрузки директории: ${e}`);
         } else {
           console.warn(`Фоновое обновление директории не удалось: ${e}`);
@@ -158,6 +245,18 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
     const isTrigger = refreshTrigger !== prevTriggerRef.current;
     prevTriggerRef.current = refreshTrigger;
 
+    if (deviceWait !== null) {
+      // Offline / unauthorized / still busy after a reconnect: asking adb now would only time out.
+      // Show what is cached; this effect runs again once the device answers.
+      loadSeqRef.current++;
+      const cached = getCachedDirectory(deviceSerial, currentPath);
+      setItems(cached ? cached.items : []);
+      setIsLoading(false);
+      setIsValidating(false);
+      setErrorMsg(null);
+      return;
+    }
+
     if (isTrigger) {
       // Invalidate affected directories upon file transfer event
       invalidateDirectory(deviceSerial, currentPath);
@@ -166,15 +265,19 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
     } else {
       loadDirectory(currentPath, false);
     }
-  }, [deviceSerial, currentPath, refreshTrigger]);
+  }, [deviceSerial, currentPath, refreshTrigger, deviceWait]);
 
   // Background bookmark prefetching for instantaneous folder opening. Normally App has already warmed
   // them on device selection; this only refreshes bookmarks that are missing or older than a minute,
   // with one batched adb call. A bookmark clicked meanwhile joins that request in loadDirectory.
   useEffect(() => {
-    if (!deviceSerial) return;
+    if (!deviceSerial || deviceWait !== null) return;
     prefetchBookmarks(deviceSerial);
-  }, [deviceSerial]);
+  }, [deviceSerial, deviceWait]);
+
+  const handleRecheckDevice = () => {
+    if (deviceSerial) waitForDevice(deviceSerial);
+  };
 
   const handleNavigate = (path: string) => {
     onPathChange(path);
@@ -302,6 +405,60 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
     it.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
+  // Why the listing can't be shown live right now; cached items (if any) stay visible below it. A regular
+  // phone answers the readiness check within milliseconds, so «busy» is only shown if it lasts a while.
+  const busyLongEnough = busySince !== null && now - busySince > 1500;
+  const waitPanel =
+    deviceWait === null || (deviceWait === 'busy' && !busyLongEnough) ? null : (
+      <div
+        className={`p-3 mb-3 rounded-xl border text-xs flex items-start gap-2.5 ${
+          deviceWait === 'busy'
+            ? 'bg-sky-500/10 border-sky-500/20 text-sky-200'
+            : deviceWait === 'unresponsive'
+            ? 'bg-rose-500/10 border-rose-500/20 text-rose-300'
+            : 'bg-amber-500/10 border-amber-500/20 text-amber-200'
+        }`}
+      >
+        {deviceWait === 'busy' ? (
+          <LoaderCircle className="w-4 h-4 shrink-0 mt-px animate-spin text-sky-400" />
+        ) : deviceWait === 'offline' ? (
+          <WifiOff className="w-4 h-4 shrink-0 mt-px text-amber-400" />
+        ) : deviceWait === 'unauthorized' ? (
+          <ShieldAlert className="w-4 h-4 shrink-0 mt-px text-amber-400" />
+        ) : (
+          <AlertCircle className="w-4 h-4 shrink-0 mt-px text-rose-400" />
+        )}
+        <div className="flex-1 min-w-0 space-y-0.5">
+          <div className="font-semibold">
+            {deviceWait === 'busy'
+              ? `Устройство подключено, но ещё не отвечает${busySince ? ` · ${formatElapsed(now - busySince)}` : ''}`
+              : deviceWait === 'offline'
+              ? 'Устройство офлайн'
+              : deviceWait === 'unauthorized'
+              ? 'Требуется разрешение отладки'
+              : 'Устройство не отвечает на команды ADB'}
+          </div>
+          <div className="opacity-80 leading-snug">
+            {deviceWait === 'busy'
+              ? 'Эмуляторы MuMu после переподключения не отвечают около 2 минут (на каждый обрыв соединения). Файлы откроются автоматически, как только устройство ответит.'
+              : deviceWait === 'offline'
+              ? 'ADB-соединение не активно. Если устройство только что переподключали, adb восстановит его сам — список обновится автоматически.'
+              : deviceWait === 'unauthorized'
+              ? 'Подтвердите «Разрешить отладку по ADB» на экране устройства.'
+              : 'Устройство не ответило за 5 минут. Проверьте эмулятор или перезапустите его.'}
+          </div>
+        </div>
+        {deviceWait === 'unresponsive' && (
+          <button
+            onClick={handleRecheckDevice}
+            className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 font-medium transition text-xs shrink-0"
+          >
+            Проверить снова
+          </button>
+        )}
+      </div>
+    );
+
   return (
     <div className="flex-1 flex flex-col h-full bg-[#0d0f17] overflow-hidden">
       {/* Top Presets & Action Toolbar */}
@@ -354,10 +511,12 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
             </button>
 
             <button
-              onClick={() => loadDirectory(currentPath, true)}
-              disabled={isLoading || !deviceSerial}
+              onClick={() =>
+                deviceWait === 'unresponsive' ? handleRecheckDevice() : loadDirectory(currentPath, true)
+              }
+              disabled={isLoading || !deviceSerial || (deviceWait !== null && deviceWait !== 'unresponsive')}
               className="p-2 rounded-xl bg-[#1b2132] hover:bg-[#252c42] border border-[#2d364f] text-[#cbd5e1] transition disabled:opacity-50"
-              title="Обновить список файлов"
+              title={deviceWait === 'unresponsive' ? 'Проверить, отвечает ли устройство' : 'Обновить список файлов'}
             >
               <RefreshCw className={`w-4 h-4 ${(isLoading || isValidating) ? 'animate-spin text-sky-400' : ''}`} />
             </button>
@@ -463,6 +622,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
 
       {/* File & Folder Table View */}
       <div className="flex-1 overflow-y-auto p-4">
+        {waitPanel}
         {errorMsg && (
           <div className="p-3 mb-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center justify-between gap-3">
             <span className="flex-1">{errorMsg}</span>
@@ -483,7 +643,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
               Подключите телефон по Wi-Fi или USB в разделе «Поиск и сопряжение» для просмотра файлов
             </p>
           </div>
-        ) : isLoading && items.length === 0 ? (
+        ) : deviceWait !== null && items.length === 0 ? null : isLoading && items.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center space-y-2">
             <RefreshCw className="w-7 h-7 animate-spin text-sky-400" />
             <span className="text-xs text-[#7c879c]">Загрузка файлов...</span>
