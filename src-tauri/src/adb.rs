@@ -79,6 +79,8 @@ pub fn get_cached_device_files(serial: &str, path: &str) -> Option<Vec<RemoteFil
     None
 }
 
+// Unconditional store; production code uses `set_cached_device_files_if_current`.
+#[cfg(test)]
 pub fn set_cached_device_files(serial: &str, path: &str, items: Vec<RemoteFileItem>) {
     if let Ok(mut cache) = FILE_LIST_CACHE.lock() {
         cache.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(30));
@@ -87,8 +89,42 @@ pub fn set_cached_device_files(serial: &str, path: &str, items: Vec<RemoteFileIt
     }
 }
 
+// Per-device invalidation counter. A listing captures it before running `ls` and is stored only if no
+// invalidation happened meanwhile, so a slow (pre)fetch can't put back a listing made stale by a
+// push/delete/mkdir that finished while it was in flight.
+static FILE_LIST_EPOCHS: std::sync::LazyLock<Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn device_files_cache_epoch(serial: &str) -> u64 {
+    FILE_LIST_EPOCHS
+        .lock()
+        .map(|e| e.get(serial).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Stores a listing unless the device's cache was invalidated after `epoch` was captured.
+/// Lock order (cache, then epochs) matches `invalidate_device_files_cache`.
+pub fn set_cached_device_files_if_current(serial: &str, path: &str, items: Vec<RemoteFileItem>, epoch: u64) -> bool {
+    if let Ok(mut cache) = FILE_LIST_CACHE.lock() {
+        let current = FILE_LIST_EPOCHS
+            .lock()
+            .map(|e| e.get(serial).copied().unwrap_or(0))
+            .unwrap_or(u64::MAX);
+        if current != epoch {
+            return false;
+        }
+        cache.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(30));
+        cache.insert((serial.to_string(), path.to_string()), (Instant::now(), items));
+        return true;
+    }
+    false
+}
+
 pub fn invalidate_device_files_cache(serial: &str, path: Option<&str>) {
     if let Ok(mut cache) = FILE_LIST_CACHE.lock() {
+        if let Ok(mut epochs) = FILE_LIST_EPOCHS.lock() {
+            *epochs.entry(serial.to_string()).or_insert(0) += 1;
+        }
         if let Some(target_path) = path {
             let norm = target_path.trim_end_matches('/').to_string();
             let parent = match norm.rfind('/') {
@@ -926,7 +962,7 @@ pub async fn connect_device(host: String) -> Result<String, String> {
 }
 
 /// Connects to the given LAN hosts in parallel. Invoked only by an explicit user action
-/// ("Подключить все"); returns the hosts that are connected afterwards (including already connected ones).
+/// (the «Подключить» button for checked LAN devices); returns the hosts that are connected afterwards (including already connected ones).
 #[tauri::command]
 pub async fn connect_lan_devices(hosts: Vec<String>) -> Result<Vec<String>, String> {
     if hosts.is_empty() {
@@ -1239,31 +1275,206 @@ pub fn parse_ls_output(output: &str, query_path: &str) -> Vec<RemoteFileItem> {
     items
 }
 
-#[tauri::command]
-pub async fn list_device_files(serial: String, remote_path: String) -> Result<Vec<RemoteFileItem>, String> {
+/// Normalizes a requested listing path into the cache key / parse path ("" -> "/sdcard", no trailing slash).
+fn listing_query_path(remote_path: &str) -> String {
     let raw = if remote_path.trim().is_empty() { "/sdcard".to_string() } else { remote_path.trim().to_string() };
     let path = raw.trim_end_matches('/').to_string();
-    let query_path = if path.is_empty() { "/".to_string() } else { path };
+    if path.is_empty() { "/".to_string() } else { path }
+}
 
-    if let Some(cached) = get_cached_device_files(&serial, &query_path) {
-        return Ok(cached);
-    }
-
-    let target_cmd_path = if query_path == "/" {
+/// Argument for `ls`: the trailing slash makes ls list the directory contents even if it is a symlink.
+fn listing_target_path(query_path: &str) -> String {
+    if query_path == "/" {
         "/".to_string()
     } else {
         format!("{}/", query_path.trim_end_matches('/'))
-    };
-    let quoted_path = quote_posix_path(&target_cmd_path);
-    
-    // Fast direct ls -la with 5s timeout (trailing slash ensures directory contents are listed even if symlink)
+    }
+}
+
+#[tauri::command]
+pub async fn list_device_files(
+    serial: String,
+    remote_path: String,
+    force: Option<bool>,
+) -> Result<Vec<RemoteFileItem>, String> {
+    let query_path = listing_query_path(&remote_path);
+
+    if force.unwrap_or(false) {
+        // Manual refresh: always ask the device. Invalidating (not just skipping the cache) also bumps the
+        // epoch, so an older listing still in flight can't put its result back afterwards.
+        invalidate_device_files_cache(&serial, Some(&query_path));
+    } else if let Some(cached) = get_cached_device_files(&serial, &query_path) {
+        return Ok(cached);
+    }
+
+    let quoted_path = quote_posix_path(&listing_target_path(&query_path));
+    let epoch = device_files_cache_epoch(&serial);
+
+    // Fast direct ls -la with 5s timeout
     let output = execute_adb_command_async(&["-s", &serial, "shell", "ls", "-la", &quoted_path], 5).await?;
 
     let items = parse_ls_output(&output, &query_path);
 
-    set_cached_device_files(&serial, &query_path, items.clone());
+    set_cached_device_files_if_current(&serial, &query_path, items.clone(), epoch);
 
     Ok(items)
+}
+
+/// Result of one directory in a batched listing. `path` echoes the requested path exactly as passed in,
+/// so the frontend can match results without re-implementing path normalization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirListing {
+    pub path: String,
+    pub items: Option<Vec<RemoteFileItem>>,
+    pub error: Option<String>,
+}
+
+/// Upper bound for one batched listing: keeps the device command line short and the run time bounded.
+const MAX_BATCH_DIRS: usize = 16;
+
+/// Unpredictable per-call token for marker lines, so a file name (which may contain newlines) can't
+/// forge a section boundary. RandomState is randomly keyed per process and re-keyed on every call.
+fn new_listing_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut parts = [0u64; 2];
+    for (i, part) in parts.iter_mut().enumerate() {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.write_u64(seq);
+        h.write_usize(i);
+        *part = h.finish();
+    }
+    format!("TF{:016x}{:016x}", parts[0], parts[1])
+}
+
+/// One shell script that lists every directory, each section framed by nonce marker lines:
+/// `<nonce>:B:<i>` before and `<nonce>:E:<i>:<exit code>` after. Every path is single-quoted.
+fn build_batch_ls_script(query_paths: &[String], nonce: &str) -> String {
+    query_paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            format!(
+                "echo {n}:B:{i}; ls -la {q} 2>&1; echo {n}:E:{i}:$?",
+                n = nonce,
+                i = i,
+                q = quote_posix_path(&listing_target_path(p))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Splits the output of `build_batch_ls_script` into per-directory results (same order as `query_paths`).
+/// A failing directory (missing, permission denied) or a section cut off by a timeout only affects itself.
+pub fn parse_batch_ls_output(output: &str, nonce: &str, query_paths: &[String]) -> Vec<Result<Vec<RemoteFileItem>, String>> {
+    let prefix = format!("{}:", nonce);
+    let mut sections: Vec<Option<(String, Option<i32>)>> = vec![None; query_paths.len()];
+    let mut current: Option<(usize, String)> = None;
+
+    for raw_line in output.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            if let Some(idx) = rest.strip_prefix("B:").and_then(|s| s.parse::<usize>().ok()) {
+                current = if idx < query_paths.len() { Some((idx, String::new())) } else { None };
+                continue;
+            }
+            if let Some(end) = rest.strip_prefix("E:") {
+                let mut it = end.splitn(2, ':');
+                let idx = it.next().and_then(|s| s.parse::<usize>().ok());
+                let code = it.next().and_then(|s| s.trim().parse::<i32>().ok());
+                if let (Some(idx), Some((cur_idx, _))) = (idx, current.as_ref()) {
+                    if idx == *cur_idx {
+                        let (cur_idx, body) = current.take().unwrap();
+                        sections[cur_idx] = Some((body, code));
+                    }
+                }
+                continue;
+            }
+        }
+        if let Some((_, body)) = current.as_mut() {
+            body.push_str(raw_line);
+            body.push('\n');
+        }
+    }
+
+    sections
+        .into_iter()
+        .zip(query_paths.iter())
+        .map(|(section, query_path)| match section {
+            Some((body, Some(0))) => Ok(parse_ls_output(&body, query_path)),
+            Some((body, code)) => {
+                let errors: Vec<&str> = body
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| l.starts_with("ls:"))
+                    .collect();
+                if !errors.is_empty() {
+                    Err(errors.join("\n").chars().take(500).collect())
+                } else {
+                    Err(format!(
+                        "Не удалось получить список файлов (код {})",
+                        code.map_or("?".to_string(), |c| c.to_string())
+                    ))
+                }
+            }
+            None => Err("Устройство не вернуло список файлов для этого каталога".to_string()),
+        })
+        .collect()
+}
+
+/// Lists several directories with ONE `adb shell` invocation (one process spawn and one device round trip
+/// instead of one per directory). Fresh cache entries are served without touching the device. Errors of
+/// individual directories (e.g. a missing bookmark folder) are reported per entry; only a failure of the
+/// whole adb call (device offline, timeout) fails the command.
+#[tauri::command]
+pub async fn list_device_dirs(serial: String, paths: Vec<String>) -> Result<Vec<DirListing>, String> {
+    if paths.len() > MAX_BATCH_DIRS {
+        return Err(format!("Слишком много каталогов в одном запросе (максимум {})", MAX_BATCH_DIRS));
+    }
+
+    let query_paths: Vec<String> = paths.iter().map(|p| listing_query_path(p)).collect();
+    let mut results: Vec<Option<Result<Vec<RemoteFileItem>, String>>> = query_paths
+        .iter()
+        .map(|q| get_cached_device_files(&serial, q).map(Ok))
+        .collect();
+
+    let missing: Vec<usize> = (0..query_paths.len()).filter(|&i| results[i].is_none()).collect();
+    if !missing.is_empty() {
+        let missing_paths: Vec<String> = missing.iter().map(|&i| query_paths[i].clone()).collect();
+        let nonce = new_listing_nonce();
+        let script = build_batch_ls_script(&missing_paths, &nonce);
+        let epoch = device_files_cache_epoch(&serial);
+        // A warm device answers 5 directories in ~0.2s; the budget covers huge folders and a phone waking
+        // up its Wi-Fi, but stays bounded for a device that is listed as "device" yet never answers.
+        let timeout = (5 + missing_paths.len() as u64).min(8);
+
+        let output = execute_adb_command_async(&["-s", &serial, "shell", &script], timeout).await?;
+        let parsed = parse_batch_ls_output(&output, &nonce, &missing_paths);
+
+        for (&i, res) in missing.iter().zip(parsed) {
+            if let Ok(items) = &res {
+                set_cached_device_files_if_current(&serial, &query_paths[i], items.clone(), epoch);
+            }
+            results[i] = Some(res);
+        }
+    }
+
+    Ok(paths
+        .into_iter()
+        .zip(results)
+        .map(|(path, res)| match res {
+            Some(Ok(items)) => DirListing { path, items: Some(items), error: None },
+            Some(Err(e)) => DirListing { path, items: None, error: Some(e) },
+            None => DirListing { path, items: None, error: Some("Нет результата".to_string()) },
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -2024,7 +2235,7 @@ mod tests {
     async fn test_list_device_files() {
         let devices = get_connected_devices().await.unwrap();
         if let Some(dev) = devices.first() {
-            let files = list_device_files(dev.serial.clone(), "/sdcard".to_string()).await;
+            let files = list_device_files(dev.serial.clone(), "/sdcard".to_string(), None).await;
             assert!(files.is_ok(), "list_device_files should succeed: {:?}", files);
             let items = files.unwrap();
             println!("Items in /sdcard on {} ({}):", dev.serial, items.len());
@@ -2071,6 +2282,140 @@ drwxrws---  2 u0_a50  media_rw 4096 2026-08-12 21:50 Alarms
         let sdcard_item = root_items.iter().find(|i| i.name == "sdcard").unwrap();
         assert!(sdcard_item.is_dir);
         assert_eq!(sdcard_item.path, "/sdcard");
+    }
+
+    #[test]
+    fn test_listing_query_and_target_path() {
+        assert_eq!(listing_query_path(""), "/sdcard");
+        assert_eq!(listing_query_path("  /sdcard/Download/ "), "/sdcard/Download");
+        assert_eq!(listing_query_path("/"), "/");
+        assert_eq!(listing_target_path("/"), "/");
+        assert_eq!(listing_target_path("/sdcard/Download"), "/sdcard/Download/");
+    }
+
+    #[test]
+    fn test_listing_nonce_is_unique_and_shell_safe() {
+        let a = new_listing_nonce();
+        let b = new_listing_nonce();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 34);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()), "{}", a);
+    }
+
+    #[test]
+    fn test_build_batch_ls_script_quotes_every_path() {
+        let paths = vec!["/sdcard/Download".to_string(), "/sdcard/O'Reilly; rm -rf /".to_string(), "/".to_string()];
+        let script = build_batch_ls_script(&paths, "TFabc");
+        assert_eq!(
+            script,
+            "echo TFabc:B:0; ls -la '/sdcard/Download/' 2>&1; echo TFabc:E:0:$?; \
+             echo TFabc:B:1; ls -la '/sdcard/O'\\''Reilly; rm -rf /' 2>&1; echo TFabc:E:1:$?; \
+             echo TFabc:B:2; ls -la '/' 2>&1; echo TFabc:E:2:$?"
+        );
+    }
+
+    #[test]
+    fn test_parse_batch_ls_output_splits_sections() {
+        let nonce = "TF0123456789abcdef0123456789abcdef";
+        let paths = vec![
+            "/sdcard/Download".to_string(),
+            "/sdcard/Music".to_string(),
+            "/sdcard/Documents".to_string(),
+        ];
+        let out = format!(
+            "{n}:B:0\r\n\
+             total 8\r\n\
+             drwxrwx--x 2 u0 media_rw 4096 2026-03-01 12:00 .\r\n\
+             drwxrwx--x 2 u0 media_rw 4096 2026-03-01 12:00 Photos \r\n\
+             -rw-rw---- 1 u0 media_rw 10 2026-03-01 12:00 a.txt\r\n\
+             {n}:E:0:0\r\n\
+             {n}:B:1\r\n\
+             ls: /sdcard/Music/: No such file or directory\r\n\
+             {n}:E:1:1\r\n\
+             {n}:B:2\r\n\
+             total 0\r\n\
+             {n}:E:2:0\r\n",
+            n = nonce
+        );
+        let res = parse_batch_ls_output(&out, nonce, &paths);
+        assert_eq!(res.len(), 3);
+
+        let download = res[0].as_ref().unwrap();
+        let names: Vec<&str> = download.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Photos ", "a.txt"], "whitespace in names must be preserved");
+        assert_eq!(download[0].path, "/sdcard/Download/Photos ");
+
+        // A missing bookmark folder fails only its own entry
+        let err = res[1].as_ref().unwrap_err();
+        assert!(err.contains("No such file or directory"), "{}", err);
+
+        assert!(res[2].as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_batch_ls_output_rejects_forged_and_truncated_sections() {
+        let nonce = "TFfeedfacefeedfacefeedfacefeedface";
+        let paths = vec!["/sdcard/A".to_string(), "/sdcard/B".to_string(), "/sdcard/C".to_string()];
+        // Section 0 contains a file name with a newline that tries to fake a marker with a guessed nonce,
+        // section 1 has an out-of-order end marker, section 2 is cut off (e.g. timeout) without its end marker.
+        let out = format!(
+            "{n}:B:0\n\
+             -rw-rw---- 1 u0 media_rw 10 2026-03-01 12:00 evil\n\
+             TFdeadbeefdeadbeefdeadbeefdeadbeef:E:0:0\n\
+             -rw-rw---- 1 u0 media_rw 10 2026-03-01 12:00 good.txt\n\
+             {n}:E:0:0\n\
+             {n}:B:1\n\
+             {n}:E:7:0\n\
+             -rw-rw---- 1 u0 media_rw 10 2026-03-01 12:00 b.txt\n\
+             {n}:E:1:0\n\
+             {n}:B:9\n\
+             {n}:B:2\n\
+             -rw-rw---- 1 u0 media_rw 10 2026-03-01 12:00 c.txt\n",
+            n = nonce
+        );
+        let res = parse_batch_ls_output(&out, nonce, &paths);
+        let a: Vec<String> = res[0].as_ref().unwrap().iter().map(|i| i.name.clone()).collect();
+        assert_eq!(a, vec!["evil".to_string(), "good.txt".to_string()]);
+        let b: Vec<String> = res[1].as_ref().unwrap().iter().map(|i| i.name.clone()).collect();
+        assert_eq!(b, vec!["b.txt".to_string()]);
+        assert!(res[2].is_err(), "truncated section must be an error, not a partial listing");
+
+        // Output without any markers (e.g. a shell that failed to start the script)
+        let res = parse_batch_ls_output("sh: syntax error\n", nonce, &paths);
+        assert!(res.iter().all(|r| r.is_err()));
+    }
+
+    #[test]
+    fn test_parse_batch_ls_output_error_without_ls_message() {
+        let nonce = "TF1";
+        let paths = vec!["/sdcard/X".to_string()];
+        let res = parse_batch_ls_output("TF1:B:0\nTF1:E:0:2\n", nonce, &paths);
+        assert_eq!(res[0].as_ref().unwrap_err(), "Не удалось получить список файлов (код 2)");
+    }
+
+    #[test]
+    fn test_file_list_cache_ignores_listing_older_than_invalidation() {
+        let serial = "test_device_cache_epoch";
+        let path = "/sdcard/epoch";
+        let item = RemoteFileItem {
+            name: "x".to_string(),
+            path: "/sdcard/epoch/x".to_string(),
+            is_dir: false,
+            size: 1,
+            mtime: String::new(),
+            permissions: "-rw-r--r--".to_string(),
+        };
+
+        let epoch = device_files_cache_epoch(serial);
+        // A push/delete finishes while the listing is in flight
+        invalidate_device_files_cache(serial, Some("/sdcard/epoch/x"));
+        assert!(!set_cached_device_files_if_current(serial, path, vec![item.clone()], epoch));
+        assert!(get_cached_device_files(serial, path).is_none());
+
+        let epoch = device_files_cache_epoch(serial);
+        assert!(set_cached_device_files_if_current(serial, path, vec![item], epoch));
+        assert!(get_cached_device_files(serial, path).is_some());
+        invalidate_device_files_cache(serial, None);
     }
 
     #[test]

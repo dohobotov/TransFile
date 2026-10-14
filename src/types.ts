@@ -24,6 +24,13 @@ export interface RemoteFileItem {
   permissions: string;
 }
 
+/** One directory of a batched `list_device_dirs` call; `path` echoes the requested path. */
+export interface DirListing {
+  path: string;
+  items: RemoteFileItem[] | null;
+  error: string | null;
+}
+
 export interface TransferProgress {
   transfer_id: string;
   file_name: string;

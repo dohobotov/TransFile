@@ -2,6 +2,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { RemoteFileItem, formatBytes } from '../types';
 import {
+  BOOKMARK_PRESETS,
+  fetchDirectory,
+  getCachedDirectory,
+  invalidateDirectory,
+  isFresh,
+  prefetchBookmarks,
+} from '../explorerCache';
+import {
   Folder,
   File,
   FolderPlus,
@@ -31,19 +39,6 @@ interface ExplorerViewProps {
   refreshTrigger?: number;
 }
 
-interface DirectoryCacheEntry {
-  items: RemoteFileItem[];
-  timestamp: number;
-}
-
-// In-memory module-level cache that persists across tab navigation
-const directoryCache = new Map<string, DirectoryCacheEntry>();
-
-function getCacheKey(serial: string, path: string): string {
-  const normalized = path.replace(/\/+$/, '') || '/';
-  return `${serial}::${normalized}`;
-}
-
 export const ExplorerView: React.FC<ExplorerViewProps> = ({
   deviceSerial,
   currentPath,
@@ -56,7 +51,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   // Synchronously initialize from cache if available for instant 0ms first paint
   const [items, setItems] = useState<RemoteFileItem[]>(() => {
     if (deviceSerial) {
-      const cached = directoryCache.get(getCacheKey(deviceSerial, currentPath));
+      const cached = getCachedDirectory(deviceSerial, currentPath);
       if (cached) return cached.items;
     }
     return [];
@@ -64,8 +59,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
 
   const [isLoading, setIsLoading] = useState<boolean>(() => {
     if (!deviceSerial) return false;
-    const cached = directoryCache.get(getCacheKey(deviceSerial, currentPath));
-    return !cached;
+    return !getCachedDirectory(deviceSerial, currentPath);
   });
 
   const [isValidating, setIsValidating] = useState(false);
@@ -78,22 +72,23 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   const activePathRef = useRef(currentPath);
   const activeSerialRef = useRef(deviceSerial);
   const prevTriggerRef = useRef(refreshTrigger);
+  // Only the latest loadDirectory call may update the view: an older request for the same path (e.g. a
+  // revalidation or prefetch started before a delete/refresh) can finish after a newer forced one.
+  const loadSeqRef = useRef(0);
 
   useEffect(() => {
     activePathRef.current = currentPath;
     activeSerialRef.current = deviceSerial;
   }, [currentPath, deviceSerial]);
 
-  const presets = [
-    { label: 'Загрузки', path: '/sdcard/Download' },
-    { label: 'DCIM / Камера', path: '/sdcard/DCIM/Camera' },
-    { label: 'Документы', path: '/sdcard/Documents' },
-    { label: 'Картинки', path: '/sdcard/Pictures' },
-    { label: 'Музыка', path: '/sdcard/Music' },
-  ];
+  const presets = BOOKMARK_PRESETS;
 
   // SWR: Instantly show cached directory contents, revalidate in background without blocking spinners
   const loadDirectory = async (path: string, forceRefresh = false) => {
+    const seq = ++loadSeqRef.current;
+    const isCurrent = () =>
+      loadSeqRef.current === seq && activePathRef.current === path && activeSerialRef.current === deviceSerial;
+
     if (!deviceSerial) {
       setItems([]);
       setIsLoading(false);
@@ -101,18 +96,22 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
       return;
     }
 
-    const key = getCacheKey(deviceSerial, path);
-
-    // If force refresh, delete cache entry to avoid displaying stale or erroneous listings
+    // If force refresh, drop the cache entry to avoid displaying stale or erroneous listings
     if (forceRefresh) {
-      directoryCache.delete(key);
+      invalidateDirectory(deviceSerial, path);
     }
 
-    const cached = directoryCache.get(key);
+    const cached = getCachedDirectory(deviceSerial, path);
 
     if (cached && !forceRefresh) {
       setItems(cached.items);
       setIsLoading(false);
+      setErrorMsg(null);
+      // Just fetched (e.g. by the prefetch on device selection): no need to ask the device again
+      if (isFresh(cached)) {
+        setIsValidating(false);
+        return;
+      }
       setIsValidating(true);
     } else {
       setItems([]);
@@ -123,24 +122,16 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
     setErrorMsg(null);
 
     try {
-      const files = await invoke<RemoteFileItem[]>('list_device_files', {
-        serial: deviceSerial,
-        remotePath: path,
-      });
+      // Joins a prefetch of the same path that is still in flight instead of starting a second adb call
+      const files = await fetchDirectory(deviceSerial, path, forceRefresh);
 
-      // Always save fresh result in cache
-      directoryCache.set(key, {
-        items: files,
-        timestamp: Date.now(),
-      });
-
-      // Only update state if user is still viewing this path and device
-      if (activePathRef.current === path && activeSerialRef.current === deviceSerial) {
+      // Only update state if user is still viewing this path and device and no newer load started
+      if (isCurrent()) {
         setItems(files);
         setErrorMsg(null);
       }
     } catch (e: any) {
-      if (activePathRef.current === path && activeSerialRef.current === deviceSerial) {
+      if (isCurrent()) {
         if (!cached) {
           setErrorMsg(`Ошибка загрузки директории: ${e}`);
         } else {
@@ -148,7 +139,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
         }
       }
     } finally {
-      if (activePathRef.current === path && activeSerialRef.current === deviceSerial) {
+      if (isCurrent()) {
         setIsLoading(false);
         setIsValidating(false);
       }
@@ -169,67 +160,20 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
 
     if (isTrigger) {
       // Invalidate affected directories upon file transfer event
-      directoryCache.delete(getCacheKey(deviceSerial, currentPath));
-      directoryCache.delete(getCacheKey(deviceSerial, targetRemotePath));
+      invalidateDirectory(deviceSerial, currentPath);
+      invalidateDirectory(deviceSerial, targetRemotePath);
       loadDirectory(currentPath, true);
     } else {
       loadDirectory(currentPath, false);
     }
   }, [deviceSerial, currentPath, refreshTrigger]);
 
-  // Background bookmark prefetching for instantaneous folder opening
+  // Background bookmark prefetching for instantaneous folder opening. Normally App has already warmed
+  // them on device selection; this only refreshes bookmarks that are missing or older than a minute,
+  // with one batched adb call. A bookmark clicked meanwhile joins that request in loadDirectory.
   useEffect(() => {
     if (!deviceSerial) return;
-    let isCancelled = false;
-
-    const prefetchBookmarks = async () => {
-      // Give initial active directory query full ADB priority
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      if (isCancelled) return;
-
-      for (const preset of presets) {
-        if (isCancelled) break;
-        const key = getCacheKey(deviceSerial, preset.path);
-        const cached = directoryCache.get(key);
-
-        // Skip if already cached recently (within 60s)
-        if (cached && Date.now() - cached.timestamp < 60_000) {
-          continue;
-        }
-
-        try {
-          const files = await invoke<RemoteFileItem[]>('list_device_files', {
-            serial: deviceSerial,
-            remotePath: preset.path,
-          });
-
-          if (!isCancelled) {
-            directoryCache.set(key, {
-              items: files,
-              timestamp: Date.now(),
-            });
-
-            // If user clicked this preset while prefetching, show immediately
-            if (activePathRef.current === preset.path && activeSerialRef.current === deviceSerial) {
-              setItems(files);
-              setIsLoading(false);
-              setIsValidating(false);
-            }
-          }
-        } catch {
-          // Preset path might not exist yet on remote device (e.g. /sdcard/Music)
-        }
-
-        // Small delay between prefetches to keep ADB daemon responsive
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
-    };
-
-    prefetchBookmarks();
-
-    return () => {
-      isCancelled = true;
-    };
+    prefetchBookmarks(deviceSerial);
   }, [deviceSerial]);
 
   const handleNavigate = (path: string) => {
@@ -257,7 +201,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
       setNewFolderName('');
       setIsCreatingFolder(false);
       // Invalidate current path cache and refresh
-      directoryCache.delete(getCacheKey(deviceSerial, currentPath));
+      invalidateDirectory(deviceSerial, currentPath);
       loadDirectory(currentPath, true);
     } catch (e: any) {
       setErrorMsg(`Не удалось создать папку: ${e}`);
@@ -274,9 +218,9 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
         serial: deviceSerial,
         remotePath: item.path,
       });
-      directoryCache.delete(getCacheKey(deviceSerial, currentPath));
+      invalidateDirectory(deviceSerial, currentPath);
       if (item.is_dir) {
-        directoryCache.delete(getCacheKey(deviceSerial, item.path));
+        invalidateDirectory(deviceSerial, item.path);
       }
       loadDirectory(currentPath, true);
     } catch (e: any) {

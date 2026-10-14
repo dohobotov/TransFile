@@ -7,6 +7,7 @@ import { TransferView } from './components/TransferView';
 import { ExplorerView } from './components/ExplorerView';
 import { NetworkView } from './components/NetworkView';
 import { SettingsView } from './components/SettingsView';
+import { markAllDirectoriesStale, prefetchDevice } from './explorerCache';
 
 export function App() {
   const [currentTab, setCurrentTab] = useState<TabType>('transfer');
@@ -89,7 +90,7 @@ export function App() {
 
   // Discovery only: hosts are listed but never connected automatically. Connecting to every host
   // with an open :5555 would let a rogue "device" in the LAN abuse this PC's ADB key and receive files.
-  // Connection happens only on explicit user action ("Подключить все" or per-host buttons).
+  // Connection happens only on explicit user action (the «Подключить» button for checked devices).
   const scanNetwork = async () => {
     setIsScanningNetwork(true);
     try {
@@ -107,6 +108,21 @@ export function App() {
     loadDevices();
     scanNetwork();
   }, []);
+
+  // Warm the Explorer cache as soon as a usable device is selected, so opening «Файлы устройства»
+  // renders from cache instead of waiting for adb (which also absorbs the Wi-Fi wake-up delay of an idle
+  // phone). Keyed on serial/state only: device list refreshes create new objects for the same device.
+  const explorerPathRef = useRef(explorerCurrentPath);
+  useEffect(() => {
+    explorerPathRef.current = explorerCurrentPath;
+  }, [explorerCurrentPath]);
+
+  const selectedSerial = selectedDevice?.serial;
+  const selectedState = selectedDevice?.state;
+  useEffect(() => {
+    if (!selectedSerial || selectedState !== 'device') return;
+    prefetchDevice(selectedSerial, explorerPathRef.current);
+  }, [selectedSerial, selectedState]);
 
   // Listen to file transfer progress from Rust
   useEffect(() => {
@@ -126,6 +142,8 @@ export function App() {
       });
 
       if (data.status === 'completed') {
+        // Prefetched listings must not hide the new files when Explorer is opened right after a transfer
+        markAllDirectoriesStale();
         setExplorerRefreshTrigger((c) => c + 1);
       }
     }).then((unlisten) => {
@@ -198,7 +216,10 @@ export function App() {
             onNavigateToExplorer={() => setCurrentTab('explorer')}
             transfers={transfers}
             onClearTransfers={() => setTransfers([])}
-            onTransferTriggered={() => setExplorerRefreshTrigger((c) => c + 1)}
+            onTransferTriggered={() => {
+              markAllDirectoriesStale();
+              setExplorerRefreshTrigger((c) => c + 1);
+            }}
           />
         )}
 

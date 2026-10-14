@@ -20,6 +20,7 @@ pub fn run() {
             adb::pair_device,
             adb::switch_to_tcpip,
             adb::list_device_files,
+            adb::list_device_dirs,
             adb::create_device_folder,
             adb::delete_device_item,
             adb::push_files_to_multiple_devices,
